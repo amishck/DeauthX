@@ -1972,7 +1972,7 @@ if __name__ == "__main__":
         sys.exit(0)
     
     # Declare globals at the module level
-    global log_file, logger
+    # global log_file, logger
     
     if args.log:
         log_file = args.log
