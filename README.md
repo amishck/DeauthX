@@ -16,6 +16,8 @@ Developed by **Amishck**, DeauthX is a streamlined Python-based tool designed fo
 
 ---
 
+![Demo](screenshots/demo.png)
+
 ## 🚀 Installation & Requirements
 
 ### Prerequisites
@@ -23,3 +25,44 @@ You must be running **Linux** (Kali Linux, Parrot OS, or Arch recommended) and h
 
 ```bash
 sudo apt update && sudo apt install aircrack-ng network-manager python3 -y
+```
+
+### Setup
+
+  Clone the repository:
+
+```bash
+git clone https://github.com/amishck/DeauthX.git
+cd DeauthX
+```
+
+Give execution permissions:
+```Bash
+chmod +x deauthx.py
+```
+
+💻 Usage
+
+Run the tool with root privileges:
+Bash
+
+sudo python3 deauthx.py
+
+### Steps:
+
+  1. Select Interface: Choose your wireless adapter (e.g., wlan0).
+  2. Scan: Pick your target network from the live-updated list.
+  3. Analyze: The tool will scan for active clients on that network.
+  4. Attack: Launch a targeted or broadcast deauthentication pulse.
+
+--- 
+
+## ⚠️ Disclaimer
+
+DeauthX is for educational and authorized testing purposes only. Using this tool against networks you do not have explicit permission to test is illegal. The developer assumes no liability for misuse or damage caused by this program.
+
+---
+
+## 📜License
+
+This project is licensed under the [MIT License](LICENSE) - see the LICENSE file for details.
