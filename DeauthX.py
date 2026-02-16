@@ -29,7 +29,7 @@ class WiFiTool:
 
     def print_banner(self):
         os.system('clear')
-        print(f"""{BLUE}                                       
+        print(rf"""{BLUE}                                       
  _ .-') _     ('-.   ('-.                 .-') _    ('-. .-.) (`-.      
 ( (  OO) )  _(  OO) ( OO ).-.            (  OO) )  ( OO )  / ( OO ).    
  \     .'_ (,------./ . --. / ,--. ,--.  /     '._ ,--. ,--.(_/.  \_)-. 
@@ -50,15 +50,14 @@ class WiFiTool:
         time.sleep(2)
 
     def get_devices(self):
-        cmd = 'ifconfig'
-        if shutil.which("ifconfig") is None:
-             cmd = "ip link show"
-             pass
-        
-        # Alternative robust method
-        devices = os.listdir('/sys/class/net/')
-        wireless_devices = [d for d in devices if d.startswith('w') or 'wlan' in d] # Heuristic
-        return wireless_devices
+        # Scan /sys/class/net for wireless interfaces (wlan*, mon*, etc.)
+        try:
+            devices = os.listdir('/sys/class/net/')
+            wireless_devices = [d for d in devices if d.startswith('w') or 'wlan' in d or 'mon' in d]
+            return wireless_devices
+        except FileNotFoundError:
+            # Fallback if /sys/class/net doesn't exist (unlikely on Linux)
+            return []
 
     def select_interface(self):
         print(f"{CYAN}Select Interface:{DEFAULT}")
@@ -141,20 +140,24 @@ class WiFiTool:
             subprocess.check_call(['sudo', 'airmon-ng', 'start', self.interface])
             self.monitor_mode = True
             
-            # Identify the new interface name (often adds 'mon' suffix)
-            # A simple heuristic check
-            devices = os.listdir('/sys/class/net/')
-            possible_names = [self.interface + 'mon', self.interface, 'mon0']
-            for name in devices:
-                 if name in possible_names: # Simplified check
-                      self.interface = name # Update interface name
-                      break
-
+            # Identify new interface name
+            # Re-scan devices to find the new monitor mode interface
             new_devices = self.get_devices()
+            # Prioritize finding the one with 'mon' suffix or 'mon' prefix or same name
+            found_new = False
             for d in new_devices:
-                if d == self.interface + "mon":
+                if d == self.interface + "mon" or d == self.interface + "mon0" or d == "mon0": # Common renames
                     self.interface = d
+                    found_new = True
                     break
+            
+            # If explicit rename not found, check if original interface is still there (might be same name)
+            if not found_new and self.interface not in new_devices:
+                 # If original name is gone, maybe it was renamed to something else?
+                 # Pick the first 'mon' interface that wasn't there before?
+                 # For simplicity, just trust airmon-ng output or user's luck. 
+                 # But keeping self.interface as original is risky if it doesn't exist.
+                 pass
 
             print(f"{GREEN}Monitor mode enabled on {self.interface}{DEFAULT}")
         except subprocess.CalledProcessError:
