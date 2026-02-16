@@ -26,8 +26,6 @@ class WiFiTool:
         self.clients = []
         self.monitor_mode = False
         
-        # Remove global signal handler as it conflicts with local KeyboardInterrupt handling
-        # signal.signal(signal.SIGINT, self.cleanup_and_exit)
 
     def print_banner(self):
         os.system('clear')
@@ -52,15 +50,9 @@ class WiFiTool:
         time.sleep(2)
 
     def get_devices(self):
-        # Reusing logic from myworkingcode.txt, but using ip link for robustness if needed
-        # The original code parsed ifconfig, let's try to stick to that style or upgrade
-        # Using the original method for similarity as requested
         cmd = 'ifconfig'
-        # Fallback to ip link if ifconfig fails or returns empty (some systems don't have ifconfig)
         if shutil.which("ifconfig") is None:
              cmd = "ip link show"
-             # Parsing ip link is different, let's just stick to a robust method
-             # Actually, let's just use the original logic if available, otherwise os.listdir('/sys/class/net/')
              pass
         
         # Alternative robust method
@@ -94,7 +86,7 @@ class WiFiTool:
 
     def get_networks(self):
         print(f"{CYAN}Scanning for networks... (Press Ctrl+C to stop if stuck){DEFAULT}")
-        # Reusing nmcli logic
+        
         cmd = 'nmcli --terse -f BSSID,SSID,CHAN,SIGNAL dev wifi'
         try:
             output = subprocess.check_output(cmd, shell=True, text=True)
@@ -120,7 +112,6 @@ class WiFiTool:
             print(f"{RED}No networks found or scan failed.{DEFAULT}")
             sys.exit(1)
 
-        # Print logic from original
         l_ssid = max([len(n['SSID']) for n in networks]) if networks else 10
         print(f"\nNO.    BSSID{' ' * 14}SSID{' ' * (l_ssid - 3)}SIG    CHANNEL")
         print(f"{'-' * (l_ssid + 45)}")
@@ -145,8 +136,6 @@ class WiFiTool:
     def enable_monitor_mode(self):
         print(f"{CYAN}Enabling monitor mode on {self.interface}...{DEFAULT}")
         # Using airmon-ng
-        # Check if already in monitor mode? 
-        # Ideally we'd use 'iw dev' but let's stick to airmon-ng as requested implies aircrack suite usage
         try:
             subprocess.check_call(['sudo', 'airmon-ng', 'check', 'kill']) # Kill interfering processes
             subprocess.check_call(['sudo', 'airmon-ng', 'start', self.interface])
@@ -155,18 +144,13 @@ class WiFiTool:
             # Identify the new interface name (often adds 'mon' suffix)
             # A simple heuristic check
             devices = os.listdir('/sys/class/net/')
-            # Try to find one that looks like original + 'mon' or just verify original is now type monitor
-            # But airmon-ng often renames wlan0 to wlan0mon
             possible_names = [self.interface + 'mon', self.interface, 'mon0']
             for name in devices:
                  if name in possible_names: # Simplified check
                       self.interface = name # Update interface name
                       break
-            # A better way is to list again and find the one that matches
-            # Let's assume standard behavior for now or re-detect?
-            # Re-detecting is safer
+
             new_devices = self.get_devices()
-            # If original is gone and a new one with 'mon' exists, pick that
             for d in new_devices:
                 if d == self.interface + "mon":
                     self.interface = d
@@ -181,7 +165,6 @@ class WiFiTool:
         if self.monitor_mode and self.original_interface:
             print(f"\n{CYAN}Restoring {self.original_interface}...{DEFAULT}")
             try:
-                # Try to stop current interface
                 subprocess.call(['sudo', 'airmon-ng', 'stop', self.interface])
                 subprocess.call(['sudo', 'systemctl', 'restart', 'NetworkManager']) # Often needed
                 self.monitor_mode = False
@@ -226,7 +209,6 @@ class WiFiTool:
                 if os.path.exists(actual_file):
                     self.parse_clients(actual_file)
                     
-                    # Only update if list changed or every few seconds to reduce flicker
                     if len(self.clients) != last_clients_len:
                         os.system('clear')
                         print(f"{CYAN}Scanning... Press Ctrl+C to Stop.{DEFAULT}")
@@ -251,7 +233,6 @@ class WiFiTool:
                 except subprocess.TimeoutExpired:
                     proc.kill()
             
-            # Final parse to ensure we have the latest
             actual_file = csv_file + '-01.csv'
             if os.path.exists(actual_file):
                  self.parse_clients(actual_file)
@@ -274,11 +255,6 @@ class WiFiTool:
                 for line in lines[client_start_index+1:]:
                     parts = [p.strip() for p in line.split(',')]
                     if len(parts) >= 6:
-                        # Filter out associated clients only? Or all? User said "clients from selected wifi"
-                        # It's better to show all probing/associated, but ideally associated to THIS BSSID.
-                        # Airodump filters by BSSID in capture, but the CSV might show others if unassociated?
-                        # Using --bssid flag in airodump mostly filters it.
-                        # parts[5] is BSSID usually.
                         client_bssid = parts[5]
                         # Check if client is associated with our target BSSID
                         if client_bssid == self.network['BSSID']:
@@ -341,7 +317,7 @@ class WiFiTool:
     def run(self):
         self.print_banner()
         self.select_interface()
-        self.select_network() # This uses nmcli, so interface must be managed (not monitor yet ideally, but gets networks)
+        self.select_network()
         self.enable_monitor_mode()
         self.scan_clients()
         self.select_attack()
