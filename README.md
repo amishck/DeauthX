@@ -41,7 +41,7 @@ Give execution permissions:
 chmod +x deauthx.py
 ```
 
-💻 Usage
+## 💻 Usage
 
 Run the tool with root privileges:
 Bash
