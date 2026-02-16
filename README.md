@@ -44,9 +44,9 @@ chmod +x deauthx.py
 ## 💻 Usage
 
 Run the tool with root privileges:
-Bash
-
+```Bash
 sudo python3 deauthx.py
+```
 
 ### Steps:
 
