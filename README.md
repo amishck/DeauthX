@@ -16,7 +16,7 @@ Developed by **Amishck**, DeauthX is a streamlined Python-based tool designed fo
 
 ---
 
-![Demo](screenshots/demo.png)
+![Demo](demo.png)
 
 ## 🚀 Installation & Requirements
 
