@@ -50,13 +50,11 @@ class WiFiTool:
         time.sleep(2)
 
     def get_devices(self):
-        # Scan /sys/class/net for wireless interfaces (wlan*, mon*, etc.)
         try:
             devices = os.listdir('/sys/class/net/')
             wireless_devices = [d for d in devices if d.startswith('w') or 'wlan' in d or 'mon' in d]
             return wireless_devices
         except FileNotFoundError:
-            # Fallback if /sys/class/net doesn't exist (unlikely on Linux)
             return []
 
     def select_interface(self):
@@ -143,7 +141,6 @@ class WiFiTool:
             # Identify new interface name
             # Re-scan devices to find the new monitor mode interface
             new_devices = self.get_devices()
-            # Prioritize finding the one with 'mon' suffix or 'mon' prefix or same name
             found_new = False
             for d in new_devices:
                 if d == self.interface + "mon" or d == self.interface + "mon0" or d == "mon0": # Common renames
@@ -151,12 +148,7 @@ class WiFiTool:
                     found_new = True
                     break
             
-            # If explicit rename not found, check if original interface is still there (might be same name)
             if not found_new and self.interface not in new_devices:
-                 # If original name is gone, maybe it was renamed to something else?
-                 # Pick the first 'mon' interface that wasn't there before?
-                 # For simplicity, just trust airmon-ng output or user's luck. 
-                 # But keeping self.interface as original is risky if it doesn't exist.
                  pass
 
             print(f"{GREEN}Monitor mode enabled on {self.interface}{DEFAULT}")
@@ -169,7 +161,7 @@ class WiFiTool:
             print(f"\n{CYAN}Restoring {self.original_interface}...{DEFAULT}")
             try:
                 subprocess.call(['sudo', 'airmon-ng', 'stop', self.interface])
-                subprocess.call(['sudo', 'systemctl', 'restart', 'NetworkManager']) # Often needed
+                subprocess.call(['sudo', 'systemctl', 'restart', 'NetworkManager']) 
                 self.monitor_mode = False
                 print(f"{GREEN}Restored.{DEFAULT}")
             except Exception as e:
@@ -259,7 +251,6 @@ class WiFiTool:
                     parts = [p.strip() for p in line.split(',')]
                     if len(parts) >= 6:
                         client_bssid = parts[5]
-                        # Check if client is associated with our target BSSID
                         if client_bssid == self.network['BSSID']:
                             self.clients.append({
                                 'Station MAC': parts[0],
